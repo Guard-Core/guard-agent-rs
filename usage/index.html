@@ -409,6 +409,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#dynamic-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic rules
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -547,6 +558,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#dynamic-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic rules
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -574,7 +596,7 @@
 <span class="kd">let</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AgentConfig</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">"your-api-key-at-least-10-chars"</span><span class="p">);</span>
 <span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">GuardAgent</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span><span class="w">  </span><span class="c1">// validates config, resolves install id</span>
 
-<span class="n">agent</span><span class="p">.</span><span class="n">start</span><span class="p">().</span><span class="k">await</span><span class="p">;</span><span class="w">                   </span><span class="c1">// starts flush and status loops</span>
+<span class="n">agent</span><span class="p">.</span><span class="n">start</span><span class="p">().</span><span class="k">await</span><span class="p">;</span><span class="w">                   </span><span class="c1">// starts flush, status, and rules loops</span>
 <span class="n">agent</span><span class="p">.</span><span class="n">send_event</span><span class="p">(</span><span class="n">event</span><span class="p">).</span><span class="k">await</span><span class="p">;</span><span class="w">         </span><span class="c1">// enqueue a security event (never fails)</span>
 <span class="n">agent</span><span class="p">.</span><span class="n">send_metric</span><span class="p">(</span><span class="n">metric</span><span class="p">).</span><span class="k">await</span><span class="p">;</span><span class="w">       </span><span class="c1">// enqueue a security metric (never fails)</span>
 <span class="n">agent</span><span class="p">.</span><span class="n">try_send_event</span><span class="p">(</span><span class="n">event</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span><span class="w">    </span><span class="c1">// error-surfacing variant</span>
@@ -667,6 +689,32 @@ the feature, implement the <code>RedisHandler</code> trait and call
 <code>agent.attach_redis_handler(Arc::new(store)).await</code> before <code>start()</code>.
 Persistence is fail-open: a store error never blocks buffering or sending.
 See <a href="../configuration/">Configuration</a>.</p>
+<h2 id="dynamic-rules">Dynamic rules</h2>
+<p><code>get_dynamic_rules()</code> fetches the SaaS rule document from <code>GET /api/v1/rules</code>
+(the full Python-agent <code>DynamicRules</code> surface: IP lists and ban duration,
+countries, global and per-endpoint rate limits, cloud providers, user agents,
+suspicious patterns, engine overrides, and emergency mode). The document is
+cached for its own <code>ttl</code> (seconds); a failed poll returns <code>None</code> and keeps the
+last good rules cached, mirroring the Python agent. Outgoing rules polls share
+the batch-send retry machinery: the local rate limiter pre-check, the circuit
+breaker, capped <code>Retry-After</code> handling on 429, and exponential backoff.</p>
+<p><code>start</code> also spawns a background rules loop on <code>dynamic_rule_interval</code>
+(default 300s, minimum 60s). <code>get_stats()</code> reports the rules surface:
+<code>rules_fetched</code> (lifetime refreshes), <code>cached_rules</code> (whether a document is
+cached), <code>rules_last_update</code> (Unix seconds of the last refresh), and
+<code>loop_failures.rules</code> (consecutive failed polls).</p>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">guard_agent_rs</span><span class="p">::{</span><span class="n">AgentConfig</span><span class="p">,</span><span class="w"> </span><span class="n">GuardAgent</span><span class="p">};</span>
+
+<span class="kd">let</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AgentConfig</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">"your-api-key-at-least-10-chars"</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">GuardAgent</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="n">agent</span><span class="p">.</span><span class="n">start</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+
+<span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">rules</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">get_dynamic_rules</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"rules {} v{}, {} blacklisted IPs"</span><span class="p">,</span><span class="w"> </span><span class="n">rules</span><span class="p">.</span><span class="n">rule_id</span><span class="p">,</span><span class="w"> </span><span class="n">rules</span><span class="p">.</span><span class="n">version</span><span class="p">,</span><span class="w"> </span><span class="n">rules</span><span class="p">.</span><span class="n">ip_blacklist</span><span class="p">.</span><span class="n">len</span><span class="p">());</span>
+<span class="p">}</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">stats</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">get_stats</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="fm">println!</span><span class="p">(</span><span class="s">"rules refreshed {} time(s)"</span><span class="p">,</span><span class="w"> </span><span class="n">stats</span><span class="p">.</span><span class="n">rules_fetched</span><span class="p">);</span>
+</code></pre></div>
 
 
 
