@@ -36,6 +36,7 @@ use crate::config::AgentConfig;
 use crate::encryption::PayloadEncryptor;
 use crate::error::{ErrorStage, GuardAgentError};
 use crate::models::{AgentStatus, SecurityEvent, SecurityMetric, TelemetryAck};
+use crate::rate_limiter::RateLimiter;
 use crate::signing::sign_payload;
 use crate::utils::{
     calculate_backoff_delay, generate_batch_id, gzip_bytes, parse_retry_after_seconds,
@@ -58,6 +59,12 @@ pub(crate) const DEFAULT_RETRY_AFTER_SECS: f64 = 60.0;
 
 /// Maximum length of a `Retry-After` value kept for parsing.
 const RETRY_AFTER_HEADER_MAX_LEN: usize = 32;
+
+/// Local send limiter cap, matching the Python, TypeScript, and PHP agents.
+pub(crate) const RATE_LIMIT_MAX_CALLS: usize = 100;
+
+/// Local send limiter window, in seconds.
+pub(crate) const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 const HEADER_X_API_KEY: &str = "X-API-Key";
 const HEADER_X_INSTALL_ID: &str = "X-Agent-Install-Id";
@@ -179,6 +186,7 @@ pub(crate) struct HttpTransport {
     client: reqwest::Client,
     config: Arc<AgentConfig>,
     breaker: CircuitBreaker,
+    rate_limiter: RateLimiter,
     requests_sent: AtomicU64,
     requests_failed: AtomicU64,
     bytes_sent: AtomicU64,
@@ -255,6 +263,10 @@ impl HttpTransport {
             client,
             config,
             breaker: CircuitBreaker::default(),
+            rate_limiter: RateLimiter::new(
+                RATE_LIMIT_MAX_CALLS,
+                Duration::from_secs(RATE_LIMIT_WINDOW_SECS),
+            ),
             requests_sent: AtomicU64::new(0),
             requests_failed: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -521,6 +533,21 @@ impl HttpTransport {
         let mut attempt: u32 = 0;
 
         while attempt < total_attempts {
+            // Local rate limiter pre-check (mirrors
+            // _transport_send.py:197-203): like the Python and PHP agents, a
+            // blocked call sleeps the limiter's retry-after and consumes the
+            // attempt.
+            if !self.rate_limiter.acquire() {
+                let retry_after = self.rate_limiter.retry_after();
+                log::warn!(
+                    "Local rate limit exceeded, waiting {retry_after:.1}s before attempt {} for {label}",
+                    attempt + 1
+                );
+                tokio::time::sleep(Duration::from_secs_f64(retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+
             if !self.breaker.admit() {
                 let error = GuardAgentError::Transport("Circuit breaker is OPEN".to_owned());
                 if attempt + 1 == total_attempts {
@@ -1002,6 +1029,16 @@ mod tests {
             }
             .is_confirmed()
         );
+    }
+
+    #[test]
+    fn local_rate_limiter_defaults_match_the_family() {
+        assert_eq!(RATE_LIMIT_MAX_CALLS, 100);
+        assert_eq!(RATE_LIMIT_WINDOW_SECS, 60);
+        // The transport builds a 100 calls / 60s limiter, matching the
+        // Python, TypeScript, and PHP agents.
+        let transport = transport_for_test();
+        assert!(transport.rate_limiter.acquire());
     }
 
     #[test]

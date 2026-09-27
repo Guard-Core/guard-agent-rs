@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Maximum depth walked when redacting nested structured data.
@@ -17,6 +18,12 @@ pub const MAX_DETAIL_CHARS: usize = 300;
 
 /// Placeholder substituted for redacted values.
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
+/// Length, in hex characters, of the `hash_ip` digest.
+pub const HASH_IP_HEX_CHARS: usize = 16;
+
+/// Suffix appended by [`truncate_payload`] when it cuts a payload.
+pub const TRUNCATION_INDICATOR: &str = "...[TRUNCATED]";
 
 /// Computes `min(base * 2^attempt, max)`.
 ///
@@ -77,6 +84,36 @@ pub fn summarize_response_body(body: &str) -> String {
     }
     let truncated: String = collapsed.chars().take(MAX_DETAIL_CHARS).collect();
     format!("{truncated}...")
+}
+
+/// Truncates a payload to `max_size` characters with an indicator.
+///
+/// Mirrors `truncate_payload` (`guard_agent/utils.py:200-204`). This is a
+/// host-adapter helper and is not used inside the transport itself.
+#[must_use]
+pub fn truncate_payload(payload: &str, max_size: usize) -> String {
+    if payload.chars().count() <= max_size {
+        return payload.to_owned();
+    }
+    let cut: String = payload.chars().take(max_size).collect();
+    format!("{cut}{TRUNCATION_INDICATOR}")
+}
+
+/// Hashes an IP address for privacy-conscious telemetry.
+///
+/// Mirrors `hash_ip` (`guard_agent/utils.py:221-225`): SHA-256 over the
+/// concatenation of the IP and an optional salt, rendered as the first 16 hex
+/// characters. This is a host-adapter helper and is not used inside the
+/// transport itself.
+#[must_use]
+pub fn hash_ip(ip: &str, salt: &str) -> String {
+    let digest = Sha256::digest(format!("{ip}{salt}").as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex.chars().take(HASH_IP_HEX_CHARS).collect()
 }
 
 /// Compresses a payload with gzip at the default level.
@@ -244,6 +281,25 @@ mod tests {
         let summary = summarize_response_body(&long);
         assert_eq!(summary.chars().count(), MAX_DETAIL_CHARS + 3);
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_payload_matches_the_python_semantics() {
+        assert_eq!(truncate_payload("abc", 10), "abc");
+        assert_eq!(truncate_payload("abcdef", 2), "ab...[TRUNCATED]");
+        assert_eq!(truncate_payload("abcde", 5), "abcde");
+        // Length is measured in characters, like Python's `len`.
+        assert_eq!(truncate_payload("éééé", 2), "éé...[TRUNCATED]");
+    }
+
+    #[test]
+    fn hash_ip_matches_the_python_digest() {
+        // Values pinned from Python: hashlib.sha256(b"1.2.3.4").hexdigest()[:16]
+        // and the same with the "pepper" salt.
+        assert_eq!(hash_ip("1.2.3.4", ""), "6694f83c9f476da3");
+        assert_eq!(hash_ip("1.2.3.4", "pepper"), "712ac23c0601eaca");
+        assert_eq!(hash_ip("1.2.3.4", "").len(), HASH_IP_HEX_CHARS);
+        assert!(!hash_ip("1.2.3.4", "").contains("1.2.3.4"));
     }
 
     #[test]
