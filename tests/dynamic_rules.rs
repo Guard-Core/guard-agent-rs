@@ -314,6 +314,10 @@ async fn rules_loop_polls_on_the_configured_interval() {
         .await;
     let mut config = config_for(&server.uri());
     config.dynamic_rule_interval = 60;
+    // The paused-time pumps advance the clock by 61 seconds per step; a
+    // request still in flight during a pump must not hit its deadline and
+    // flip the poll into a counted failure.
+    config.timeout = 600;
     let agent = GuardAgent::new(config).unwrap();
 
     agent.start().await;
@@ -347,6 +351,9 @@ async fn failed_polls_are_counted_as_consecutive_loop_failures() {
         .await;
     let mut config = config_for(&server.uri());
     config.dynamic_rule_interval = 60;
+    // See the loop test above: pumps advance the paused clock in 61 second
+    // steps, so the request deadline must exceed a step.
+    config.timeout = 600;
     let agent = GuardAgent::new(config).unwrap();
 
     agent.start().await;
