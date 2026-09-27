@@ -186,6 +186,11 @@ pub struct AgentConfig {
     /// Secret for `X-Payload-Signature` (HMAC-SHA256, `v1=<hex>`). When unset,
     /// no signature header is sent.
     pub payload_signing_secret: Option<String>,
+    /// Project-specific AES-256 key (urlsafe-base64-encoded, from the core
+    /// backend). When set, event/metric batches are encrypted and posted to
+    /// `/api/v1/events/encrypted`; an invalid key fails startup (no
+    /// plaintext fallback), mirroring the Python agent.
+    pub project_encryption_key: Option<String>,
     /// Redis persistence settings for the built-in backend.
     #[cfg(feature = "persistence")]
     pub redis: Option<RedisConfig>,
@@ -220,6 +225,10 @@ impl std::fmt::Debug for AgentConfig {
             .field(
                 "payload_signing_secret",
                 &self.payload_signing_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "project_encryption_key",
+                &self.project_encryption_key.as_ref().map(|_| "<redacted>"),
             )
             .field("on_error", &self.on_error.as_ref().map(|_| "<hook>"));
         #[cfg(feature = "persistence")]
@@ -258,6 +267,7 @@ impl AgentConfig {
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
             install_id: None,
             payload_signing_secret: None,
+            project_encryption_key: None,
             #[cfg(feature = "persistence")]
             redis: None,
             on_error: None,

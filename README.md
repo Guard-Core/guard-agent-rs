@@ -67,6 +67,10 @@ let status = agent.get_status().await;
 let stats = agent.get_stats().await;
 ```
 
+## Encryption
+
+Set `config.project_encryption_key` (a urlsafe-base64-encoded 256-bit key from the core backend) and every event/metric batch is AES-256-GCM encrypted and POSTed to `/api/v1/events/encrypted`, byte-compatible with the Python agent. An invalid key fails startup; the agent never falls back to plaintext.
+
 ## Reliability semantics
 
 The ingestion API contract is verified against the Guard backend source (`guard-core-api/guard_core_api/api/routers/telemetry_router.py`):
@@ -99,6 +103,7 @@ All fields live on `AgentConfig` and have defaults; see the rustdoc for the full
 | `retry_attempts` | `3` | Total attempts are this value plus one |
 | `compression_threshold` | `1024` bytes | Bodies at or above this size are gzipped |
 | `payload_signing_secret` | none | No signature header when unset |
+| `project_encryption_key` | none | Urlsafe-base64 AES-256 key; enables encrypted ingest to `/api/v1/events/encrypted` |
 | `install_id` | generated | Persisted at `~/.guard-agent/install-id` when not overridden |
 
 ## Feature flags

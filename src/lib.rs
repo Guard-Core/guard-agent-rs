@@ -60,6 +60,7 @@
 pub mod agent;
 pub mod circuit_breaker;
 pub mod config;
+pub mod encryption;
 pub mod error;
 pub mod install_id;
 pub mod models;
@@ -80,6 +81,7 @@ pub use config::{
 #[cfg(feature = "persistence")]
 #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
 pub use config::{DEFAULT_REDIS_KEY_PREFIX, RedisConfig};
+pub use encryption::{PayloadEncryptor, canonical_json, urlsafe_base64_encode};
 pub use error::{ConfigError, ErrorStage, GuardAgentError};
 pub use models::{AgentHealth, AgentStatus, MetricType, SecurityEvent, SecurityMetric};
 #[cfg(feature = "persistence")]
