@@ -388,6 +388,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#encryption" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encryption
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#persistence" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -515,6 +526,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#encryption" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encryption
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#persistence" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -627,6 +649,16 @@ triggers an early flush.</p>
 <code>X-Payload-Signature: v1=&lt;hex hmac-sha256&gt;</code>. The signature covers the
 UNCOMPRESSED JSON body; the server verifies after decompression. Gzip
 (<code>compression_enabled</code>) only affects the wire bytes.</p>
+<h2 id="encryption">Encryption</h2>
+<p>When <code>project_encryption_key</code> is set (a urlsafe-base64-encoded 256-bit key
+issued by the core backend), event and metric batches are encrypted with
+AES-256-GCM and POSTed to <code>/api/v1/events/encrypted</code> as
+<code>{encrypted_payload, batch_id, agent_version, guard_version,
+guard_core_version}</code>; the wire format is byte-compatible with the Python
+agent (canonical JSON plaintext, 12-byte nonce prefix, 16-byte auth tag,
+padded urlsafe base64). An invalid key fails <code>GuardAgent::new</code>; the agent
+never falls back to plaintext. Signing and compression apply to the
+envelope body exactly as they do to plaintext batches.</p>
 <h2 id="persistence">Persistence</h2>
 <p>With the <code>persistence</code> feature and a <code>redis: Option&lt;RedisConfig&gt;</code> set, every
 buffered item is persisted before the send attempt and deleted only on

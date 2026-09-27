@@ -690,6 +690,11 @@ suffix are stripped).</p>
 <td>HMAC-SHA256 secret over the uncompressed body (<code>X-Payload-Signature: v1=&lt;hex&gt;</code>)</td>
 </tr>
 <tr>
+<td><code>project_encryption_key</code></td>
+<td><code>None</code></td>
+<td>Urlsafe-base64 AES-256 key from the core backend. When set, event/metric batches are AES-256-GCM encrypted and POSTed to <code>/api/v1/events/encrypted</code>; an invalid key fails startup (no plaintext fallback)</td>
+</tr>
+<tr>
 <td><code>sensitive_headers</code></td>
 <td>default list</td>
 <td>Header names redacted from event metadata</td>
