@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 /// The event types the Guard ecosystem emits, mirroring the Python agent's
@@ -381,6 +381,113 @@ pub(crate) struct TelemetryAck {
     pub errors: Option<Vec<String>>,
 }
 
+/// Returns the current UTC time, used as the default rule timestamp.
+fn now_utc() -> DateTime<Utc> {
+    Utc::now()
+}
+
+/// Dynamic rules received from the `SaaS` platform via `GET /api/v1/rules`,
+/// mirroring the Python agent's `DynamicRules` model field for field
+/// (`guard_agent/models.py:250-324`).
+///
+/// The server serializes the pydantic model, so the wire payload is
+/// `snake_case` with ISO-8601 timestamps, `endpoint_rate_limits` as
+/// `{endpoint: [requests, window]}` pairs, and `blocked_cloud_providers` as
+/// an array (a Python set on the model). Deserialization applies the
+/// pydantic defaults for missing fields; a wrong-typed known field fails the
+/// parse, which the transport converts to a `None` result exactly like the
+/// Python agent's blanket `except`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DynamicRules {
+    /// Unique rule ID.
+    pub rule_id: String,
+    /// Rule version number.
+    pub version: u64,
+    /// Rule creation/update timestamp.
+    #[serde(default = "now_utc")]
+    pub timestamp: DateTime<Utc>,
+    /// Rule expiration time.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Cache TTL in seconds (drives the client-side rules cache).
+    pub ttl: u64,
+    /// IPs to ban.
+    pub ip_blacklist: Vec<String>,
+    /// IPs to allow.
+    pub ip_whitelist: Vec<String>,
+    /// Ban duration in seconds.
+    pub ip_ban_duration: u64,
+    /// Countries to block.
+    pub blocked_countries: Vec<String>,
+    /// Countries to allow.
+    pub whitelist_countries: Vec<String>,
+    /// Global rate limit.
+    pub global_rate_limit: Option<u64>,
+    /// Global rate window in seconds.
+    pub global_rate_window: Option<u64>,
+    /// Per-endpoint rate limits: endpoint to `(requests, window)`.
+    pub endpoint_rate_limits: BTreeMap<String, (u64, u64)>,
+    /// Cloud providers to block.
+    pub blocked_cloud_providers: BTreeSet<String>,
+    /// User agents to block.
+    pub blocked_user_agents: Vec<String>,
+    /// Additional suspicious patterns.
+    pub suspicious_patterns: Vec<String>,
+    /// Override penetration detection setting.
+    pub enable_penetration_detection: Option<bool>,
+    /// Override IP banning setting.
+    pub enable_ip_banning: Option<bool>,
+    /// Override rate limiting setting.
+    pub enable_rate_limiting: Option<bool>,
+    /// Override auto-ban threshold setting.
+    pub auto_ban_threshold: Option<u64>,
+    /// Override auto-ban duration setting.
+    pub auto_ban_duration: Option<u64>,
+    /// Override rate-limit auto-ban setting.
+    pub enable_rate_limit_auto_ban: Option<bool>,
+    /// Emergency lockdown mode.
+    pub emergency_mode: bool,
+    /// Emergency whitelist IPs.
+    pub emergency_whitelist: Vec<String>,
+    /// Only allow emergency whitelist IPs.
+    pub emergency_whitelist_only: bool,
+    /// Optional rule message from the server.
+    pub message: Option<String>,
+}
+
+impl Default for DynamicRules {
+    fn default() -> Self {
+        Self {
+            rule_id: "default-rule".to_owned(),
+            version: 1,
+            timestamp: now_utc(),
+            expires_at: None,
+            ttl: 300,
+            ip_blacklist: Vec::new(),
+            ip_whitelist: Vec::new(),
+            ip_ban_duration: 3600,
+            blocked_countries: Vec::new(),
+            whitelist_countries: Vec::new(),
+            global_rate_limit: None,
+            global_rate_window: None,
+            endpoint_rate_limits: BTreeMap::new(),
+            blocked_cloud_providers: BTreeSet::new(),
+            blocked_user_agents: Vec::new(),
+            suspicious_patterns: Vec::new(),
+            enable_penetration_detection: None,
+            enable_ip_banning: None,
+            enable_rate_limiting: None,
+            auto_ban_threshold: None,
+            auto_ban_duration: None,
+            enable_rate_limit_auto_ban: None,
+            emergency_mode: false,
+            emergency_whitelist: Vec::new(),
+            emergency_whitelist_only: false,
+            message: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +647,134 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), KNOWN_EVENT_TYPES.len());
+    }
+
+    #[test]
+    fn dynamic_rules_defaults_match_the_python_model() {
+        let rules = DynamicRules::default();
+        assert_eq!(rules.rule_id, "default-rule");
+        assert_eq!(rules.version, 1);
+        assert_eq!(rules.ttl, 300);
+        assert_eq!(rules.ip_ban_duration, 3600);
+        assert!(rules.ip_blacklist.is_empty() && rules.ip_whitelist.is_empty());
+        assert!(rules.blocked_countries.is_empty() && rules.whitelist_countries.is_empty());
+        assert!(rules.global_rate_limit.is_none() && rules.global_rate_window.is_none());
+        assert!(rules.endpoint_rate_limits.is_empty());
+        assert!(rules.blocked_cloud_providers.is_empty());
+        assert!(rules.blocked_user_agents.is_empty() && rules.suspicious_patterns.is_empty());
+        assert!(rules.enable_penetration_detection.is_none());
+        assert!(rules.enable_ip_banning.is_none());
+        assert!(rules.enable_rate_limiting.is_none());
+        assert!(rules.auto_ban_threshold.is_none() && rules.auto_ban_duration.is_none());
+        assert!(rules.enable_rate_limit_auto_ban.is_none());
+        assert!(!rules.emergency_mode && !rules.emergency_whitelist_only);
+        assert!(rules.emergency_whitelist.is_empty());
+        assert!(rules.message.is_none() && rules.expires_at.is_none());
+    }
+
+    #[test]
+    fn dynamic_rules_parse_the_snake_case_wire_payload_with_defaults() {
+        // Sparse payload: every omitted field takes the pydantic default,
+        // exactly like `DynamicRules(**response_data)` in the Python agent.
+        let value = json!({
+            "rule_id": "rule-42",
+            "version": 7,
+            "ttl": 60,
+            "ip_blacklist": ["9.9.9.9"],
+            "blocked_countries": ["KP"],
+            "global_rate_limit": 100,
+            "global_rate_window": 60,
+            "endpoint_rate_limits": {"/api/login": [5, 60]},
+            "blocked_cloud_providers": ["AWS", "AWS", "GCP"],
+            "enable_ip_banning": true,
+            "auto_ban_threshold": 10,
+            "emergency_mode": true,
+            "emergency_whitelist": ["10.0.0.1"],
+            "emergency_whitelist_only": true,
+            "message": "lockdown",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "timestamp": "2026-01-02T03:04:05Z"
+        });
+        let rules: DynamicRules = serde_json::from_value(value).unwrap();
+        assert_eq!(rules.rule_id, "rule-42");
+        assert_eq!(rules.version, 7);
+        assert_eq!(rules.ttl, 60);
+        assert_eq!(rules.ip_blacklist, vec!["9.9.9.9".to_owned()]);
+        assert_eq!(rules.ip_ban_duration, 3600);
+        assert_eq!(rules.blocked_countries, vec!["KP".to_owned()]);
+        assert_eq!(rules.global_rate_limit, Some(100));
+        assert_eq!(rules.global_rate_window, Some(60));
+        assert_eq!(rules.endpoint_rate_limits.get("/api/login"), Some(&(5, 60)));
+        assert_eq!(
+            rules.blocked_cloud_providers.len(),
+            2,
+            "set semantics dedupe"
+        );
+        assert_eq!(rules.enable_ip_banning, Some(true));
+        assert_eq!(rules.auto_ban_threshold, Some(10));
+        assert!(rules.emergency_mode && rules.emergency_whitelist_only);
+        assert_eq!(rules.emergency_whitelist, vec!["10.0.0.1".to_owned()]);
+        assert_eq!(rules.message.as_deref(), Some("lockdown"));
+        assert_eq!(
+            rules.timestamp,
+            DateTime::<Utc>::from(DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z").unwrap())
+        );
+        assert_eq!(
+            rules.expires_at,
+            Some(
+                DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .into()
+            )
+        );
+        assert_eq!(rules.enable_penetration_detection, None);
+    }
+
+    #[test]
+    fn dynamic_rules_round_trip_serialization_is_snake_case() {
+        let mut endpoint_rate_limits = BTreeMap::new();
+        endpoint_rate_limits.insert("/x".to_owned(), (3, 30));
+        let mut blocked_cloud_providers = BTreeSet::new();
+        blocked_cloud_providers.insert("AWS".to_owned());
+        let rules = DynamicRules {
+            ip_blacklist: vec!["1.2.3.4".to_owned()],
+            endpoint_rate_limits,
+            blocked_cloud_providers,
+            ..DynamicRules::default()
+        };
+
+        let value = serde_json::to_value(&rules).unwrap();
+        let obj = value.as_object().unwrap();
+        for key in [
+            "rule_id",
+            "ip_blacklist",
+            "ip_ban_duration",
+            "endpoint_rate_limits",
+            "blocked_cloud_providers",
+            "emergency_whitelist_only",
+        ] {
+            assert!(obj.contains_key(key), "missing {key}");
+        }
+        let parsed: DynamicRules = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, rules);
+    }
+
+    #[test]
+    fn dynamic_rules_reject_wrong_typed_fields_like_pydantic() {
+        let result = serde_json::from_value::<DynamicRules>(json!({"ttl": "soon"}));
+        assert!(result.is_err(), "string ttl must fail the parse");
+
+        let result = serde_json::from_value::<DynamicRules>(json!({
+            "endpoint_rate_limits": {"/x": [5]}
+        }));
+        assert!(result.is_err(), "incomplete pair must fail the parse");
+
+        let result = serde_json::from_value::<DynamicRules>(json!({
+            "ip_blacklist": [1, 2]
+        }));
+        assert!(
+            result.is_err(),
+            "non-string list entries must fail the parse"
+        );
     }
 }

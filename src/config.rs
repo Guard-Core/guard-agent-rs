@@ -19,6 +19,12 @@ pub const DEFAULT_STATUS_INTERVAL_SECS: u64 = 300;
 /// Minimum accepted status push interval in seconds.
 pub const MIN_STATUS_INTERVAL_SECS: u64 = 60;
 
+/// Default dynamic rules poll interval in seconds.
+pub const DEFAULT_DYNAMIC_RULE_INTERVAL_SECS: u64 = 300;
+
+/// Minimum accepted dynamic rules poll interval in seconds.
+pub const MIN_DYNAMIC_RULE_INTERVAL_SECS: u64 = 60;
+
 /// Default high watermark ratio that triggers an early flush.
 pub const DEFAULT_HIGH_WATERMARK_RATIO: f64 = 0.8;
 
@@ -149,6 +155,9 @@ pub struct AgentConfig {
     /// Interval between status pushes, in seconds. Minimum
     /// [`MIN_STATUS_INTERVAL_SECS`].
     pub status_interval: u64,
+    /// Interval between dynamic rules polls, in seconds. Minimum
+    /// [`MIN_DYNAMIC_RULE_INTERVAL_SECS`].
+    pub dynamic_rule_interval: u64,
     /// Occupancy ratio that triggers an early flush. Must be in `(0, 1]`.
     pub high_watermark_ratio: f64,
     /// Maximum number of concurrent flushes. Must be at least 1.
@@ -207,6 +216,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("buffer_size", &self.buffer_size)
             .field("flush_interval", &self.flush_interval)
             .field("status_interval", &self.status_interval)
+            .field("dynamic_rule_interval", &self.dynamic_rule_interval)
             .field("high_watermark_ratio", &self.high_watermark_ratio)
             .field("max_concurrent_flushes", &self.max_concurrent_flushes)
             .field("buffer_overflow_policy", &self.buffer_overflow_policy)
@@ -248,6 +258,7 @@ impl AgentConfig {
             buffer_size: DEFAULT_BUFFER_SIZE,
             flush_interval: DEFAULT_FLUSH_INTERVAL_SECS,
             status_interval: DEFAULT_STATUS_INTERVAL_SECS,
+            dynamic_rule_interval: DEFAULT_DYNAMIC_RULE_INTERVAL_SECS,
             high_watermark_ratio: DEFAULT_HIGH_WATERMARK_RATIO,
             max_concurrent_flushes: 1,
             buffer_overflow_policy: BufferOverflowPolicy::Drop,
@@ -346,6 +357,12 @@ impl AgentConfig {
                 "status_interval must be at least {MIN_STATUS_INTERVAL_SECS} seconds"
             ));
         }
+        if self.dynamic_rule_interval < MIN_DYNAMIC_RULE_INTERVAL_SECS {
+            problems.push(format!(
+                "dynamic_rule_interval must be at least \
+                 {MIN_DYNAMIC_RULE_INTERVAL_SECS} seconds"
+            ));
+        }
         if self.timeout == 0 {
             problems.push("timeout must be greater than 0".to_owned());
         }
@@ -403,6 +420,7 @@ mod tests {
         assert_eq!(config.buffer_size, 100);
         assert_eq!(config.flush_interval, 30);
         assert_eq!(config.status_interval, 300);
+        assert_eq!(config.dynamic_rule_interval, 300);
         assert!((config.high_watermark_ratio - 0.8).abs() < f64::EPSILON);
         assert_eq!(config.max_concurrent_flushes, 1);
         assert_eq!(config.buffer_overflow_policy, BufferOverflowPolicy::Drop);
@@ -509,6 +527,24 @@ mod tests {
         config.endpoint = "   ".to_owned();
         let err = config.validate().unwrap_err();
         assert_eq!(err.problems, vec!["endpoint must not be empty".to_owned()]);
+    }
+
+    #[test]
+    fn dynamic_rule_interval_minimum_is_enforced() {
+        let mut config = valid_config();
+        assert_eq!(config.dynamic_rule_interval, 300);
+        config.validate().unwrap();
+        config.dynamic_rule_interval = 59;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.contains("dynamic_rule_interval must be at least 60")),
+            "{:?}",
+            err.problems
+        );
+        config.dynamic_rule_interval = 60;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

@@ -29,6 +29,7 @@ suffix are stripped).
 | `buffer_size` | 100 | Per-kind queue capacity |
 | `flush_interval` | 30s | Periodic flush cadence and retry backoff base |
 | `status_interval` | 300s | Status report cadence (minimum 60s) |
+| `dynamic_rule_interval` | 300s | Dynamic rules polling cadence (minimum 60s) |
 | `high_watermark_ratio` | 0.8 | Combined occupancy that triggers an early flush |
 | `max_concurrent_flushes` | 1 | In-flight flush cycle bound |
 | `buffer_overflow_policy` | `Drop` | Full-buffer policy (`Drop`, `Block`, `Raise`) |

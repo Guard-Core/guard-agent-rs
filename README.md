@@ -21,6 +21,7 @@ Released. Version 3.0.2, published to crates.io.
 - **Optional Redis persistence** (feature `persistence`): every accepted record is written with a TTL on enqueue, deleted only on confirmation, and reloaded into the buffer on startup. Alternatively, implement the `RedisHandler` trait and inject your own store.
 - **Payload hygiene**: gzip compression above a threshold, HMAC-SHA256 request signing (`X-Payload-Signature: v1=<hex>`), and redaction of sensitive metadata and tag keys.
 - **Failure isolation**: `send_event` and `send_metric` never fail; telemetry problems are visible through stats, status, logs, and an optional `on_error` hook, never in the caller's request path.
+- **Dynamic rules sync**: `GET /api/v1/rules` fetched through the shared retry machinery (rate limiter, circuit breaker, capped `Retry-After`), cached for the document TTL, refreshed by a background loop on `dynamic_rule_interval`; a failed poll keeps the last good rules.
 
 ## Installation
 
@@ -98,6 +99,7 @@ All fields live on `AgentConfig` and have defaults; see the rustdoc for the full
 | `endpoint` | `https://api.guard-core.com` | Trailing slashes and a legacy `/api/v1` suffix are stripped |
 | `buffer_size` | `100` | Per kind (events and metrics each) |
 | `flush_interval` | `30` seconds | Time trigger |
+| `dynamic_rule_interval` | `300` seconds | Dynamic rules polling cadence, minimum 60 |
 | `high_watermark_ratio` | `0.8` | Occupancy trigger |
 | `buffer_overflow_policy` | `drop` | `drop`, `block`, or `raise` |
 | `retry_attempts` | `3` | Total attempts are this value plus one |

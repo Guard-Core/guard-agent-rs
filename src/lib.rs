@@ -74,9 +74,10 @@ pub use agent::{AgentStats, GuardAgent, LoopFailures};
 pub use circuit_breaker::CircuitBreakerState;
 pub use config::{
     AgentConfig, BufferOverflowPolicy, DEFAULT_BACKOFF_FACTOR, DEFAULT_BUFFER_SIZE,
-    DEFAULT_COMPRESSION_THRESHOLD, DEFAULT_ENDPOINT, DEFAULT_FLUSH_INTERVAL_SECS,
-    DEFAULT_HIGH_WATERMARK_RATIO, DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_RETRY_ATTEMPTS,
-    DEFAULT_SENSITIVE_HEADERS, DEFAULT_STATUS_INTERVAL_SECS, DEFAULT_TIMEOUT_SECS, MIN_API_KEY_LEN,
+    DEFAULT_COMPRESSION_THRESHOLD, DEFAULT_DYNAMIC_RULE_INTERVAL_SECS, DEFAULT_ENDPOINT,
+    DEFAULT_FLUSH_INTERVAL_SECS, DEFAULT_HIGH_WATERMARK_RATIO, DEFAULT_MAX_PAYLOAD_SIZE,
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_SENSITIVE_HEADERS, DEFAULT_STATUS_INTERVAL_SECS,
+    DEFAULT_TIMEOUT_SECS, MIN_API_KEY_LEN, MIN_DYNAMIC_RULE_INTERVAL_SECS,
     MIN_STATUS_INTERVAL_SECS,
 };
 #[cfg(feature = "persistence")]
@@ -85,7 +86,8 @@ pub use config::{DEFAULT_REDIS_KEY_PREFIX, RedisConfig};
 pub use encryption::{PayloadEncryptor, canonical_json, urlsafe_base64_encode};
 pub use error::{ConfigError, ErrorStage, GuardAgentError};
 pub use models::{
-    AgentHealth, AgentStatus, KNOWN_EVENT_TYPES, MetricType, SecurityEvent, SecurityMetric,
+    AgentHealth, AgentStatus, DynamicRules, KNOWN_EVENT_TYPES, MetricType, SecurityEvent,
+    SecurityMetric,
 };
 #[cfg(feature = "persistence")]
 #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
