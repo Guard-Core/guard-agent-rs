@@ -45,6 +45,7 @@ suffix are stripped).
 | `compression_threshold` | 1024 | Gzip cutoff in bytes |
 | `max_payload_size` | 1024 | Advisory payload size hint (kept for agent-family parity; the transport does not truncate) |
 | `payload_signing_secret` | `None` | HMAC-SHA256 secret over the uncompressed body (`X-Payload-Signature: v1=<hex>`) |
+| `project_encryption_key` | `None` | Urlsafe-base64 AES-256 key from the core backend. When set, event/metric batches are AES-256-GCM encrypted and POSTed to `/api/v1/events/encrypted`; an invalid key fails startup (no plaintext fallback) |
 | `sensitive_headers` | default list | Header names redacted from event metadata |
 
 ## Redis persistence

@@ -62,6 +62,15 @@ pub enum GuardAgentError {
     /// A Redis persistence operation failed.
     #[error("Redis error: {0}")]
     Redis(String),
+
+    /// An encryption operation failed (mirrors the Python `EncryptionError`).
+    #[error("{0}")]
+    Encryption(String),
+
+    /// Encryption initialization failed; plaintext fallback is forbidden
+    /// (mirrors the Python `EncryptionConfigError`).
+    #[error("{0}")]
+    EncryptionConfig(String),
 }
 
 /// Validation failure report for [`AgentConfig`](crate::AgentConfig).
@@ -85,6 +94,8 @@ pub enum ErrorStage {
     FlushEvents,
     /// A metrics flush failed and the batch was requeued.
     FlushMetrics,
+    /// An encryption step failed (key setup or payload encryption).
+    Encryption,
 }
 
 impl fmt::Display for ErrorStage {
@@ -93,6 +104,7 @@ impl fmt::Display for ErrorStage {
             Self::TransportSend => "transport_send",
             Self::FlushEvents => "flush_events",
             Self::FlushMetrics => "flush_metrics",
+            Self::Encryption => "encryption",
         };
         f.write_str(label)
     }

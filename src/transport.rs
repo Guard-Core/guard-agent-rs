@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 
 use crate::circuit_breaker::CircuitBreaker;
 use crate::config::AgentConfig;
+use crate::encryption::PayloadEncryptor;
 use crate::error::{ErrorStage, GuardAgentError};
 use crate::models::{AgentStatus, SecurityEvent, SecurityMetric, TelemetryAck};
 use crate::signing::sign_payload;
@@ -182,6 +183,7 @@ pub(crate) struct HttpTransport {
     requests_failed: AtomicU64,
     bytes_sent: AtomicU64,
     header_signature: HeaderName,
+    encryptor: Option<PayloadEncryptor>,
 }
 
 impl std::fmt::Debug for HttpTransport {
@@ -231,6 +233,24 @@ impl HttpTransport {
                 GuardAgentError::Transport(format!("failed to build HTTP client: {error}"))
             })?;
 
+        // Fail-closed encryption init (mirrors
+        // _transport_lifecycle._init_encryption): when a key is configured,
+        // an invalid key or a failed round-trip verification aborts
+        // construction; plaintext fallback is forbidden.
+        let encryptor = match config.project_encryption_key.as_deref() {
+            None | Some("") => None,
+            Some(key) => {
+                let encryptor = PayloadEncryptor::new(key)?;
+                if !encryptor.verify_key() {
+                    return Err(GuardAgentError::EncryptionConfig(
+                        "Encryption round-trip failed at startup; refusing plaintext fallback"
+                            .to_owned(),
+                    ));
+                }
+                Some(encryptor)
+            }
+        };
+
         Ok(Self {
             client,
             config,
@@ -239,6 +259,7 @@ impl HttpTransport {
             requests_failed: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             header_signature: header_name(HEADER_X_PAYLOAD_SIGNATURE),
+            encryptor,
         })
     }
 
@@ -259,7 +280,13 @@ impl HttpTransport {
     }
 
     /// Sends an events or metrics batch, splitting on 413 as needed.
+    /// When a project encryption key is configured, the batch goes to
+    /// `/api/v1/events/encrypted` in the Python envelope instead.
     pub(crate) async fn send_batch(&self, items: BatchItems) -> SendOutcome {
+        if self.encryptor.is_some() {
+            return self.send_batch_encrypted(&items).await;
+        }
+
         let body = match self.build_batch_body(&items) {
             Ok(body) => body,
             Err(error) => {
@@ -296,6 +323,111 @@ impl HttpTransport {
             }
             Ok(outcome) => outcome,
             Err(too_large) => self.split_or_drop(items, too_large.detail).await,
+        }
+    }
+
+    /// Builds and POSTs the encrypted envelope (mirrors `_post_encrypted`
+    /// and `_build_encrypted_payload`): only the events/metrics arrays are
+    /// encrypted; the envelope carries `batch_id` and the version fields in
+    /// clear. Serialization failure fires the `encryption` hook and the
+    /// batch is retained.
+    async fn send_batch_encrypted(&self, items: &BatchItems) -> SendOutcome {
+        let encryptor = self
+            .encryptor
+            .as_ref()
+            .expect("encryption checked before send_batch_encrypted");
+
+        let payload = match (
+            items.items_value(),
+            serde_json::to_value(Value::Array(Vec::new())),
+        ) {
+            (Ok(items_value), Ok(empty)) => {
+                let (events, metrics) = match items {
+                    BatchItems::Events(_) => (items_value, empty),
+                    BatchItems::Metrics(_) => (empty, items_value),
+                };
+                serde_json::json!({ "events": events, "metrics": metrics })
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                let error = GuardAgentError::Serialization(error);
+                log::error!(
+                    "Aborting encrypted POST to /api/v1/events/encrypted; payload serialization failed and batch retained: {error}"
+                );
+                self.fire_hook(ErrorStage::Encryption, &error);
+                return SendOutcome::Failed { error };
+            }
+        };
+
+        let encrypted_payload = match encryptor.encrypt(&payload, None) {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                log::error!("Aborting encrypted POST; encryption failed: {error}");
+                self.fire_hook(ErrorStage::Encryption, &error);
+                return SendOutcome::Failed { error };
+            }
+        };
+
+        let envelope = serde_json::json!({
+            "encrypted_payload": encrypted_payload,
+            "batch_id": generate_batch_id(),
+            "agent_version": crate::AGENT_VERSION,
+            "guard_version": self.config.guard_version,
+            "guard_core_version": self.config.guard_core_version,
+        });
+        let body = match serde_json::to_vec(&envelope) {
+            Ok(body) => body,
+            Err(error) => {
+                let error = GuardAgentError::Serialization(error);
+                log::error!(
+                    "Aborting encrypted POST to /api/v1/events/encrypted; payload serialization failed and batch retained: {error}"
+                );
+                self.fire_hook(ErrorStage::Encryption, &error);
+                return SendOutcome::Failed { error };
+            }
+        };
+
+        match self.send_with_retry("events/encrypted", &body).await {
+            Ok(SendOutcome::PermanentDrop {
+                status_code,
+                detail,
+            }) => {
+                log::warn!(
+                    "Dropping {} batch of {}; permanently rejected ({}): {detail}",
+                    items.label(),
+                    items.summary(),
+                    status_code
+                );
+                let error = GuardAgentError::Permanent {
+                    status_code,
+                    detail: detail.clone(),
+                };
+                self.fire_hook(ErrorStage::TransportSend, &error);
+                SendOutcome::PermanentDrop {
+                    status_code,
+                    detail,
+                }
+            }
+            Ok(outcome) => outcome,
+            Err(too_large) => {
+                // The encrypted endpoint does not split; an oversize
+                // encrypted batch is dropped with the same confirmation
+                // semantics as an unencodable singleton.
+                log::warn!(
+                    "Dropping encrypted {} batch of {}; payload exceeds size cap even as a single item: {}",
+                    items.label(),
+                    items.len(),
+                    too_large.detail
+                );
+                let detail = too_large.detail;
+                let error = GuardAgentError::PayloadTooLarge {
+                    detail: detail.clone(),
+                };
+                self.fire_hook(ErrorStage::TransportSend, &error);
+                SendOutcome::PermanentDrop {
+                    status_code: 413,
+                    detail,
+                }
+            }
         }
     }
 
