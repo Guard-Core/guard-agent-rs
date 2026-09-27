@@ -35,7 +35,7 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::config::AgentConfig;
 use crate::encryption::PayloadEncryptor;
 use crate::error::{ErrorStage, GuardAgentError};
-use crate::models::{AgentStatus, SecurityEvent, SecurityMetric, TelemetryAck};
+use crate::models::{AgentStatus, DynamicRules, SecurityEvent, SecurityMetric, TelemetryAck};
 use crate::rate_limiter::RateLimiter;
 use crate::signing::sign_payload;
 use crate::utils::{
@@ -100,6 +100,18 @@ impl SendOutcome {
     pub(crate) const fn is_confirmed(&self) -> bool {
         matches!(self, Self::Accepted | Self::PermanentDrop { .. })
     }
+}
+
+/// Internal classification of a single GET attempt (dynamic rules fetch).
+enum GetAttempt {
+    /// A 2xx response whose body parsed as JSON (any JSON type; the caller
+    /// rejects non-object payloads like the Python agent).
+    Ok(Value),
+    /// A 429 response with a parsed `Retry-After`.
+    RateLimited { retry_after_seconds: f64 },
+    /// Any other failure: network error, unreadable body, unparseable 2xx
+    /// body, or a non-2xx status.
+    Retryable { error: GuardAgentError },
 }
 
 /// Internal classification of a single HTTP attempt.
@@ -467,6 +479,169 @@ impl HttpTransport {
                 self.fire_hook(ErrorStage::TransportSend, &error);
                 SendOutcome::Failed { error }
             }
+        }
+    }
+
+    /// Fetches the dynamic rules document from `GET /api/v1/rules`, mirroring
+    /// `fetch_dynamic_rules` (`guard_agent/_transport_send.py:140-152`).
+    /// Returns `None` when the server has no payload or the fetch fails;
+    /// never panics and never surfaces an error, exactly like the Python
+    /// agent's blanket `except`.
+    pub(crate) async fn fetch_rules(&self) -> Option<DynamicRules> {
+        let value = self.get_with_retry("rules").await?;
+        match serde_json::from_value::<DynamicRules>(value) {
+            Ok(rules) => Some(rules),
+            Err(error) => {
+                log::error!("Failed to fetch dynamic rules: {error}");
+                None
+            }
+        }
+    }
+
+    /// GET request with retry logic and the circuit breaker, mirroring
+    /// `_get_with_retry` (`guard_agent/_transport_send.py:238-289`): the
+    /// local rate limiter pre-check applies, a blocked call sleeps the
+    /// limiter's suggested interval and consumes the attempt, 429 honors
+    /// `Retry-After` (capped), other failures back off exponentially, and
+    /// every exhaustion path records a failed request. Returns the parsed
+    /// JSON object, or `None` when the attempts are exhausted.
+    async fn get_with_retry(&self, label: &str) -> Option<Value> {
+        let total_attempts = self.config.retry_attempts.saturating_add(1);
+        let url = format!("{}/api/v1/{label}", self.config.endpoint);
+        let mut attempt: u32 = 0;
+
+        while attempt < total_attempts {
+            // Local rate limiter pre-check, shared with the batch-send path
+            // (mirrors _transport_send.py:241-246).
+            if !self.rate_limiter.acquire() {
+                let retry_after = self.rate_limiter.retry_after();
+                log::warn!(
+                    "Local rate limit exceeded, waiting {retry_after:.1}s before attempt {} for GET {url}",
+                    attempt + 1
+                );
+                tokio::time::sleep(Duration::from_secs_f64(retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+
+            if !self.breaker.admit() {
+                let error = GuardAgentError::Transport("Circuit breaker is OPEN".to_owned());
+                if attempt + 1 == total_attempts {
+                    self.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    log::error!("All retry attempts failed for GET {url}: {error}");
+                    return None;
+                }
+                log::warn!(
+                    "Circuit breaker is OPEN; delaying attempt {} for GET {url}",
+                    attempt + 1
+                );
+                self.sleep_backoff(attempt).await;
+                attempt += 1;
+                continue;
+            }
+
+            match self.get_attempt(&url).await {
+                GetAttempt::Ok(value) => {
+                    self.breaker.record_success();
+                    if value.is_object() {
+                        self.requests_sent.fetch_add(1, Ordering::Relaxed);
+                        return Some(value);
+                    }
+                    // The Python agent only accepts dict payloads; anything
+                    // else counts the request as failed and retries.
+                    self.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("GET {url} returned a non-object JSON payload; retrying");
+                }
+                GetAttempt::RateLimited {
+                    retry_after_seconds,
+                } => {
+                    self.breaker.record_failure();
+                    let delay = retry_after_seconds.min(MAX_RETRY_AFTER_SECS);
+                    if attempt + 1 == total_attempts {
+                        self.requests_failed.fetch_add(1, Ordering::Relaxed);
+                        log::error!("All retry attempts failed for GET {url}: rate limited");
+                        return None;
+                    }
+                    log::warn!(
+                        "Server rate-limited GET {url}; sleeping {delay:.1}s per Retry-After"
+                    );
+                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                }
+                GetAttempt::Retryable { error } => {
+                    self.breaker.record_failure();
+                    if attempt + 1 == total_attempts {
+                        self.requests_failed.fetch_add(1, Ordering::Relaxed);
+                        log::error!("All retry attempts failed for GET {url}: {error}");
+                        return None;
+                    }
+                    log::warn!("GET attempt {} failed for {url}: {error}", attempt + 1);
+                    self.sleep_backoff(attempt).await;
+                }
+            }
+            attempt += 1;
+        }
+
+        None
+    }
+
+    /// Performs one GET attempt and classifies the outcome.
+    async fn get_attempt(&self, url: &str) -> GetAttempt {
+        let response = match self.client.get(url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return GetAttempt::Retryable {
+                    error: GuardAgentError::Transport(format!(
+                        "HTTP client error for GET {url}: {error}"
+                    )),
+                };
+            }
+        };
+
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .chars()
+                    .take(RETRY_AFTER_HEADER_MAX_LEN)
+                    .collect::<String>()
+            });
+        let body_text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                return GetAttempt::Retryable {
+                    error: GuardAgentError::Transport(format!(
+                        "Failed to read response body for GET {url}: {error}"
+                    )),
+                };
+            }
+        };
+
+        if (200..300).contains(&status) {
+            return serde_json::from_str::<Value>(&body_text).map_or_else(
+                |_| GetAttempt::Retryable {
+                    error: GuardAgentError::Transport(format!(
+                        "GET {url} returned status {status} with unparseable JSON body"
+                    )),
+                },
+                GetAttempt::Ok,
+            );
+        }
+        if status == 429 {
+            return GetAttempt::RateLimited {
+                retry_after_seconds: parse_retry_after_seconds(
+                    retry_after.as_deref(),
+                    DEFAULT_RETRY_AFTER_SECS,
+                ),
+            };
+        }
+        GetAttempt::Retryable {
+            error: GuardAgentError::Transport(format!(
+                "Client error {status} for GET {url}: {}",
+                summarize_response_body(&body_text)
+            )),
         }
     }
 

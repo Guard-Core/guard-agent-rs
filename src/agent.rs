@@ -16,7 +16,7 @@ use crate::circuit_breaker::CircuitBreakerState;
 use crate::config::{AgentConfig, BufferOverflowPolicy};
 use crate::error::{ErrorStage, GuardAgentError};
 use crate::install_id::resolve_install_id;
-use crate::models::{AgentHealth, AgentStatus, SecurityEvent, SecurityMetric};
+use crate::models::{AgentHealth, AgentStatus, DynamicRules, SecurityEvent, SecurityMetric};
 use crate::persistence::{NAMESPACE_EVENTS, NAMESPACE_METRICS, PERSIST_TTL_SECONDS, RedisHandler};
 use crate::transport::{BatchItems, HttpTransport, SendOutcome};
 use crate::utils::{Redactable, Redactor, calculate_backoff_delay, generate_short_key};
@@ -63,6 +63,8 @@ pub struct LoopFailures {
     pub flush: u32,
     /// Consecutive failures of the status loop task.
     pub status: u32,
+    /// Consecutive failures of the dynamic rules loop task.
+    pub rules: u32,
 }
 
 /// Interior shared state guarded by a single async mutex.
@@ -89,6 +91,9 @@ struct CoreState {
     loop_failures: LoopFailures,
     status_consecutive_failures: u32,
     last_status_push_ok: Option<bool>,
+    cached_rules: Option<DynamicRules>,
+    rules_last_update: Option<Instant>,
+    rules_fetched: u64,
 }
 
 impl CoreState {
@@ -116,6 +121,9 @@ impl CoreState {
             loop_failures: LoopFailures::default(),
             status_consecutive_failures: 0,
             last_status_push_ok: None,
+            cached_rules: None,
+            rules_last_update: None,
+            rules_fetched: 0,
         }
     }
 }
@@ -168,11 +176,19 @@ pub struct AgentStats {
     pub status_consecutive_failures: u32,
     /// Outcome of the most recent status push.
     pub last_status_push_ok: Option<bool>,
+    /// Lifetime count of successful dynamic rules refreshes.
+    pub rules_fetched: u64,
+    /// Whether a dynamic rules document is currently cached.
+    pub cached_rules: bool,
+    /// Unix timestamp, in seconds, of the last successful rules refresh
+    /// (`0.0` when none has happened yet).
+    pub rules_last_update: f64,
 }
 
 struct LoopHandles {
     flush: JoinHandle<()>,
     status: JoinHandle<()>,
+    rules: JoinHandle<()>,
 }
 
 /// State shared between the public handle and the background loops.
@@ -301,7 +317,7 @@ impl GuardAgent {
         self.shared.core.lock().await.redis_handler = Some(handler);
     }
 
-    /// Starts the background flush and status loops.
+    /// Starts the background flush, status, and dynamic rules loops.
     ///
     /// When the `persistence` feature is enabled and `redis` is configured,
     /// this connects the built-in Redis backend (degrading to memory-only
@@ -333,6 +349,7 @@ impl GuardAgent {
         *loops = Some(LoopHandles {
             flush: tokio::spawn(flush_loop(Arc::clone(&self.shared))),
             status: tokio::spawn(status_loop(Arc::clone(&self.shared))),
+            rules: tokio::spawn(rules_loop(Arc::clone(&self.shared))),
         });
     }
 
@@ -352,14 +369,17 @@ impl GuardAgent {
             let LoopHandles {
                 mut flush,
                 mut status,
+                mut rules,
             } = handles;
             let _ = tokio::time::timeout(LOOP_SHUTDOWN_GRACE, async {
                 let _ = (&mut flush).await;
                 let _ = (&mut status).await;
+                let _ = (&mut rules).await;
             })
             .await;
             flush.abort();
             status.abort();
+            rules.abort();
         }
 
         self.await_inflight().await;
@@ -591,6 +611,21 @@ impl GuardAgent {
         push_status_once(&self.shared).await;
     }
 
+    /// Returns the latest dynamic rules, or `None` when unavailable.
+    ///
+    /// Mirrors `RulesMixin.get_dynamic_rules`
+    /// (`guard_agent/_client_loops.py:19-38`): the cached copy is served
+    /// while it is younger than its own `ttl` (seconds); otherwise the
+    /// transport fetches `GET /api/v1/rules`, and a successful fetch updates
+    /// the cache and the counters. A failed fetch returns `None` (the
+    /// transport logs and yields `None` in the baseline) while the last good
+    /// rules stay cached for the next poll. The background
+    /// [`rules loop`](Self::start) calls this on
+    /// [`dynamic_rule_interval`](AgentConfig) cadence.
+    pub async fn get_dynamic_rules(&self) -> Option<DynamicRules> {
+        fetch_dynamic_rules_once(&self.shared).await
+    }
+
     /// Returns a snapshot of agent counters and transport state.
     pub async fn get_stats(&self) -> AgentStats {
         let core = self.shared.core.lock().await;
@@ -618,6 +653,11 @@ impl GuardAgent {
             last_flush: core.last_flush,
             status_consecutive_failures: core.status_consecutive_failures,
             last_status_push_ok: core.last_status_push_ok,
+            rules_fetched: core.rules_fetched,
+            cached_rules: core.cached_rules.is_some(),
+            rules_last_update: core
+                .rules_last_update
+                .map_or(0.0, |instant| unix_now() - instant.elapsed().as_secs_f64()),
         }
     }
 
@@ -1184,4 +1224,86 @@ async fn status_loop(shared: Arc<Shared>) {
         }
         push_status_once(&shared).await;
     }
+}
+
+/// One dynamic rules refresh, shared by the public
+/// [`GuardAgent::get_dynamic_rules`](crate::GuardAgent::get_dynamic_rules)
+/// and the background loop. Mirrors `RulesMixin.get_dynamic_rules`
+/// (`guard_agent/_client_loops.py:19-38`): the cached copy is served while
+/// it is younger than its own `ttl` (seconds); otherwise the transport
+/// fetches `GET /api/v1/rules`, and a successful fetch updates the cache and
+/// the counters. A failed fetch returns `None` (the transport logs and
+/// yields `None` in the baseline) while the last good rules stay cached for
+/// the next poll.
+async fn fetch_dynamic_rules_once(shared: &Shared) -> Option<DynamicRules> {
+    let now = Instant::now();
+    let cached = {
+        let core = shared.core.lock().await;
+        let ttl = core.cached_rules.as_ref().map_or(0, |rules| rules.ttl);
+        let fresh = core
+            .rules_last_update
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(ttl));
+        if fresh {
+            core.cached_rules.clone()
+        } else {
+            None
+        }
+    };
+    if let Some(rules) = cached {
+        return Some(rules);
+    }
+
+    let fetched = shared.transport.fetch_rules().await;
+    let mut core = shared.core.lock().await;
+    // On `None` the transport already logged; the last good rules stay
+    // cached.
+    fetched.inspect(|rules| {
+        core.cached_rules = Some(rules.clone());
+        core.rules_last_update = Some(Instant::now());
+        core.rules_fetched += 1;
+        log::debug!("Dynamic rules updated");
+    })
+}
+
+/// Background dynamic rules loop, mirroring `_rules_loop`
+/// (`guard_agent/_client_loops.py:103-116`): every
+/// `dynamic_rule_interval` seconds, refresh the rules cache; a successful
+/// iteration resets the consecutive-failure counter, and a failure only
+/// logs (warn below the threshold, error at/above), never propagates.
+async fn rules_loop(shared: Arc<Shared>) {
+    let interval = Duration::from_secs(shared.config.dynamic_rule_interval);
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {},
+            () = shared.shutdown.notified() => break,
+        }
+        if !shared.running.load(Ordering::Acquire) {
+            break;
+        }
+        // get_dynamic_rules never panics; the fetch is fully contained.
+        let outcome = fetch_dynamic_rules_once(&shared).await;
+        let mut core = shared.core.lock().await;
+        if outcome.is_some() {
+            core.loop_failures.rules = 0;
+        } else {
+            core.loop_failures.rules = core.loop_failures.rules.saturating_add(1);
+            let consecutive = core.loop_failures.rules;
+            let message = format!(
+                "rules loop failed {consecutive} consecutive time(s); \
+                 keeping the last good dynamic rules cached"
+            );
+            if consecutive >= STATUS_LOG_ERROR_THRESHOLD {
+                log::error!("{message}");
+            } else {
+                log::warn!("{message}");
+            }
+        }
+    }
+}
+
+/// Current wall-clock time as Unix seconds.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |delta| delta.as_secs_f64())
 }

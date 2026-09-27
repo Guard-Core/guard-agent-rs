@@ -8,7 +8,7 @@ use guard_agent_rs::{AgentConfig, GuardAgent};
 let config = AgentConfig::new("your-api-key-at-least-10-chars");
 let agent = GuardAgent::new(config)?;  // validates config, resolves install id
 
-agent.start().await;                   // starts flush and status loops
+agent.start().await;                   // starts flush, status, and rules loops
 agent.send_event(event).await;         // enqueue a security event (never fails)
 agent.send_metric(metric).await;       // enqueue a security metric (never fails)
 agent.try_send_event(event).await?;    // error-surfacing variant
@@ -97,3 +97,34 @@ the feature, implement the `RedisHandler` trait and call
 `agent.attach_redis_handler(Arc::new(store)).await` before `start()`.
 Persistence is fail-open: a store error never blocks buffering or sending.
 See [Configuration](configuration.md).
+
+## Dynamic rules
+
+`get_dynamic_rules()` fetches the SaaS rule document from `GET /api/v1/rules`
+(the full Python-agent `DynamicRules` surface: IP lists and ban duration,
+countries, global and per-endpoint rate limits, cloud providers, user agents,
+suspicious patterns, engine overrides, and emergency mode). The document is
+cached for its own `ttl` (seconds); a failed poll returns `None` and keeps the
+last good rules cached, mirroring the Python agent. Outgoing rules polls share
+the batch-send retry machinery: the local rate limiter pre-check, the circuit
+breaker, capped `Retry-After` handling on 429, and exponential backoff.
+
+`start` also spawns a background rules loop on `dynamic_rule_interval`
+(default 300s, minimum 60s). `get_stats()` reports the rules surface:
+`rules_fetched` (lifetime refreshes), `cached_rules` (whether a document is
+cached), `rules_last_update` (Unix seconds of the last refresh), and
+`loop_failures.rules` (consecutive failed polls).
+
+```rust
+use guard_agent_rs::{AgentConfig, GuardAgent};
+
+let config = AgentConfig::new("your-api-key-at-least-10-chars");
+let agent = GuardAgent::new(config)?;
+agent.start().await;
+
+if let Some(rules) = agent.get_dynamic_rules().await {
+    println!("rules {} v{}, {} blacklisted IPs", rules.rule_id, rules.version, rules.ip_blacklist.len());
+}
+let stats = agent.get_stats().await;
+println!("rules refreshed {} time(s)", stats.rules_fetched);
+```

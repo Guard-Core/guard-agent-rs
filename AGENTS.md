@@ -80,7 +80,7 @@ cargo build -p guard-agent-basic-usage
 
 ## Configuration
 
-`AgentConfig::new(api_key)` fills defaults; `GuardAgent::new` validates and normalizes (endpoint trailing slashes and legacy `/api/v1` suffix are stripped). Important fields: `endpoint`, `project_id`, `buffer_size` (100 per kind), `flush_interval` (30s), `status_interval` (300s, minimum 60), `high_watermark_ratio` (0.8), `buffer_overflow_policy` (`drop`/`block`/`raise`), `retry_attempts` (3), `backoff_factor` (1.0), `timeout` (30s), `compression_enabled` + `compression_threshold` (1024 bytes), `payload_signing_secret`, `install_id`, and with feature `persistence` a `redis: Option<RedisConfig>` (URL carries credentials and DB index; `key_prefix` defaults to `guard:agent`).
+`AgentConfig::new(api_key)` fills defaults; `GuardAgent::new` validates and normalizes (endpoint trailing slashes and legacy `/api/v1` suffix are stripped). Important fields: `endpoint`, `project_id`, `buffer_size` (100 per kind), `flush_interval` (30s), `status_interval` (300s, minimum 60), `dynamic_rule_interval` (300s, minimum 60; drives the background rules loop started by `start`), `high_watermark_ratio` (0.8), `buffer_overflow_policy` (`drop`/`block`/`raise`), `retry_attempts` (3), `backoff_factor` (1.0), `timeout` (30s), `compression_enabled` + `compression_threshold` (1024 bytes), `payload_signing_secret`, `install_id`, and with feature `persistence` a `redis: Option<RedisConfig>` (URL carries credentials and DB index; `key_prefix` defaults to `guard:agent`).
 
 A custom store works without the feature: implement `RedisHandler` (five async methods: set, get, delete, list, clear, all namespace-scoped) and call `agent.attach_redis_handler(Arc::new(store)).await` before `start()`.
 
