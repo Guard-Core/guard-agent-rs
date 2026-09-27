@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-09-27
+
+Parity release: the 3.0.2 to 3.1.0 agent feature train, in the same window as the Python and TypeScript agents.
+
+### Added
+
+- **AES-256-GCM encrypted ingest** (`src/encryption.rs`): batches can be encrypted end to end before they leave the host, matching the Python agent contract.
+- **Sensitive-header redaction**: configurable `sensitive_headers` / metadata and tag keys (`src/config.rs`, `DEFAULT_SENSITIVE_HEADERS`) redacted before buffering.
+- **Dynamic rules**: the agent pulls rule updates from the ingestion API and applies them locally without a restart (`src/agent.rs`, `src/models.rs`), with tests in `tests/dynamic_rules.rs`.
+- **Local rate limiter** (`src/rate_limiter.rs`): token-bucket local limiting protects the host from event floods before anything is buffered or shipped.
+- **`on_error` and `max_payload_size` knobs** (`src/config.rs`): operators choose the failure behavior and cap the serialized payload size.
+- **Helper ports** (`src/utils.rs`): the LOW-surface helpers shared by the new subsystems.
+
+### Changed
+
+- **Crate version is 3.1.0** (`Cargo.toml` / `Cargo.lock`), matching the release tag.
+
 ## [3.0.2] - 2026-09-24
 
 ### Added
