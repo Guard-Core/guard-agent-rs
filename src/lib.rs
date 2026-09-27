@@ -65,6 +65,7 @@ pub mod error;
 pub mod install_id;
 pub mod models;
 pub mod persistence;
+pub mod rate_limiter;
 pub mod signing;
 pub mod transport;
 pub mod utils;
@@ -83,13 +84,17 @@ pub use config::{
 pub use config::{DEFAULT_REDIS_KEY_PREFIX, RedisConfig};
 pub use encryption::{PayloadEncryptor, canonical_json, urlsafe_base64_encode};
 pub use error::{ConfigError, ErrorStage, GuardAgentError};
-pub use models::{AgentHealth, AgentStatus, MetricType, SecurityEvent, SecurityMetric};
+pub use models::{
+    AgentHealth, AgentStatus, KNOWN_EVENT_TYPES, MetricType, SecurityEvent, SecurityMetric,
+};
 #[cfg(feature = "persistence")]
 #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
 pub use persistence::RedisClientHandler;
 pub use persistence::{
     InMemoryRedisStore, NAMESPACE_EVENTS, NAMESPACE_METRICS, PERSIST_TTL_SECONDS, RedisHandler,
 };
+pub use rate_limiter::RateLimiter;
+pub use utils::{hash_ip, truncate_payload};
 
 /// Version of this agent, reported in batch payloads and the User-Agent.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");

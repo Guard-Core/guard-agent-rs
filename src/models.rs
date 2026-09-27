@@ -11,6 +11,57 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// The event types the Guard ecosystem emits, mirroring the Python agent's
+/// `KNOWN_EVENT_TYPES` (`guard_agent/models.py:20-55`).
+///
+/// Like the baseline, this list is documentation, not validation:
+/// `SecurityEvent::event_type` stays a free `String` so engine-side renames
+/// and additions can never break the consumer. The wave-1-6 rename entries
+/// `user_agent_blocked` and `decorator_violation` and the trailing
+/// `security_headers_applied` / `csp_violation` are part of the pinned
+/// surface.
+pub const KNOWN_EVENT_TYPES: [&str; 39] = [
+    "ip_banned",
+    "ip_unbanned",
+    "ip_blocked",
+    "ip_ban_failed",
+    "rate_limited",
+    "rate_limit_script_reloaded",
+    "suspicious_request",
+    "cloud_blocked",
+    "country_blocked",
+    "penetration_attempt",
+    "behavioral_violation",
+    "user_agent_blocked",
+    "custom_request_check",
+    "decorator_violation",
+    "decoding_error",
+    "detection_engine_callback_error",
+    "geo_lookup_failed",
+    "https_enforced",
+    "pattern_anomaly_slow_execution",
+    "pattern_anomaly_timeout",
+    "pattern_anomaly_statistical_anomaly",
+    "redis_connection",
+    "redis_error",
+    "dynamic_rule_applied",
+    "dynamic_rule_updated",
+    "path_excluded",
+    "route_unresolved",
+    "pattern_detected",
+    "pattern_added",
+    "pattern_removed",
+    "access_denied",
+    "authentication_failed",
+    "content_filtered",
+    "emergency_mode_activated",
+    "emergency_mode_block",
+    "dynamic_rule_violation",
+    "security_bypass",
+    "security_headers_applied",
+    "csp_violation",
+];
+
 /// Metric types accepted by the ingestion API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -468,5 +519,26 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: SecurityEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn known_event_types_match_the_python_surface() {
+        // The Python baseline list has 39 entries.
+        assert_eq!(KNOWN_EVENT_TYPES.len(), 39);
+        // Wave renames and the trailing entries are part of the pinned
+        // surface.
+        for expected in [
+            "user_agent_blocked",
+            "decorator_violation",
+            "security_headers_applied",
+            "csp_violation",
+        ] {
+            assert!(KNOWN_EVENT_TYPES.contains(&expected), "missing {expected}");
+        }
+        // No duplicates.
+        let mut seen = KNOWN_EVENT_TYPES.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), KNOWN_EVENT_TYPES.len());
     }
 }
