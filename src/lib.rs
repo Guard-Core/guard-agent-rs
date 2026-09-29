@@ -100,3 +100,56 @@ pub use utils::{hash_ip, truncate_payload};
 
 /// Version of this agent, reported in batch payloads and the User-Agent.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Test-only support shared by the unit-test modules of this crate.
+///
+/// The unit test binary installs no logger by default, and the `log` facade
+/// skips a record's argument evaluation entirely when the level filter is
+/// lower than the record, so every `warn!`/`info!` branch whose interior
+/// regions are part of the coverage surface needs a trace-level logger
+/// installed before the branch fires. The installer is idempotent.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A logger that swallows every record (the tests only need the argument
+    /// evaluation side effect of an installed, fully-enabled logger).
+    struct TraceLogger;
+
+    impl log::Log for TraceLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::max_level()
+        }
+
+        fn log(&self, _record: &log::Record<'_>) {}
+
+        fn flush(&self) {}
+    }
+
+    /// Installs the trace logger exactly once. Every test that depends on
+    /// log-argument evaluation calls this first; `log` admits a single
+    /// logger per process, so later calls are no-ops.
+    pub fn install_trace_logger() {
+        static SETUP: std::sync::Once = std::sync::Once::new();
+        SETUP.call_once(|| {
+            let _ = log::set_boxed_logger(Box::new(TraceLogger));
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    #[test]
+    fn trace_logger_contract_holds() {
+        install_trace_logger();
+        let logger = TraceLogger;
+        let metadata = log::Metadata::builder().level(log::Level::Warn).build();
+        assert!(
+            log::Log::enabled(&logger, &metadata),
+            "trace level admits warnings"
+        );
+        let record = log::Record::builder()
+            .args(format_args!("test record"))
+            .level(log::Level::Warn)
+            .target(module_path!())
+            .build();
+        log::Log::log(&logger, &record);
+        log::Log::flush(&logger);
+    }
+}

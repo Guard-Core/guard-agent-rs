@@ -409,6 +409,13 @@ pub const DEFAULT_SENSITIVE_HEADERS: &[&str] = &[
 mod tests {
     use super::*;
 
+    #[test]
+    fn overflow_policy_display_matches_the_python_labels() {
+        assert_eq!(BufferOverflowPolicy::Drop.to_string(), "drop");
+        assert_eq!(BufferOverflowPolicy::Block.to_string(), "block");
+        assert_eq!(BufferOverflowPolicy::Raise.to_string(), "raise");
+    }
+
     fn valid_config() -> AgentConfig {
         AgentConfig::new("test-api-key-1234")
     }

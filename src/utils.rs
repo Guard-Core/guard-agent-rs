@@ -120,11 +120,11 @@ pub fn hash_ip(ip: &str, salt: &str) -> String {
 #[must_use]
 pub fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    // Writing into a `Vec` cannot fail, and `finish` only surfaces that
-    // impossible I/O error; fall back to the raw payload instead of panicking.
-    if encoder.write_all(body).is_err() {
-        return body.to_vec();
-    }
+    // Writing into a `Vec` cannot fail (the `Write` impl for `Vec` is
+    // infallible), so the write result carries no information; `finish` only
+    // surfaces that same impossible I/O error, and its fallback returns the
+    // raw payload instead of panicking.
+    let _ = encoder.write_all(body);
     encoder.finish().unwrap_or_else(|_| body.to_vec())
 }
 

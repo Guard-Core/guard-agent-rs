@@ -185,6 +185,19 @@ mod tests {
     }
 
     #[test]
+    fn state_reports_half_open_once_the_window_elapses_without_admitting() {
+        let breaker = CircuitBreaker::new(1, Duration::from_millis(30));
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitBreakerState::Open);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            breaker.state(),
+            CircuitBreakerState::HalfOpen,
+            "the recovery window elapsed; the position is half-open before any probe"
+        );
+    }
+
+    #[test]
     fn successful_probe_closes_the_circuit() {
         let breaker = CircuitBreaker::new(1, Duration::from_millis(30));
         breaker.record_failure();

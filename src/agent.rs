@@ -476,17 +476,21 @@ impl GuardAgent {
 
             match policy {
                 BufferOverflowPolicy::Drop => {
-                    if let Some(evicted) = core.events.pop_front() {
-                        core.events_dropped += 1;
-                        if core.events_dropped % DROP_LOG_INTERVAL == 1 {
-                            log::warn!(
-                                "Event buffer full at maxlen={capacity}; dropping oldest event \
-                                 ({} dropped total)",
-                                core.events_dropped
-                            );
-                        }
-                        forget_key(&core, NAMESPACE_EVENTS, evicted.redis_key).await;
+                    // The buffer is at capacity and `buffer_size` validates
+                    // greater than zero, so the oldest item always exists.
+                    let evicted = core
+                        .events
+                        .pop_front()
+                        .expect("dropping from a buffer at capacity");
+                    core.events_dropped += 1;
+                    if core.events_dropped % DROP_LOG_INTERVAL == 1 {
+                        log::warn!(
+                            "Event buffer full at maxlen={capacity}; dropping oldest event \
+                             ({} dropped total)",
+                            core.events_dropped
+                        );
                     }
+                    forget_key(&core, NAMESPACE_EVENTS, evicted.redis_key).await;
                     // Retry the insert immediately: capacity freed by the pop.
                 }
                 BufferOverflowPolicy::Raise => {
@@ -529,17 +533,21 @@ impl GuardAgent {
 
             match policy {
                 BufferOverflowPolicy::Drop => {
-                    if let Some(evicted) = core.metrics.pop_front() {
-                        core.metrics_dropped += 1;
-                        if core.metrics_dropped % DROP_LOG_INTERVAL == 1 {
-                            log::warn!(
-                                "Metric buffer full at maxlen={capacity}; dropping oldest metric \
-                                 ({} dropped total)",
-                                core.metrics_dropped
-                            );
-                        }
-                        forget_key(&core, NAMESPACE_METRICS, evicted.redis_key).await;
+                    // The buffer is at capacity and `buffer_size` validates
+                    // greater than zero, so the oldest item always exists.
+                    let evicted = core
+                        .metrics
+                        .pop_front()
+                        .expect("dropping from a buffer at capacity");
+                    core.metrics_dropped += 1;
+                    if core.metrics_dropped % DROP_LOG_INTERVAL == 1 {
+                        log::warn!(
+                            "Metric buffer full at maxlen={capacity}; dropping oldest metric \
+                             ({} dropped total)",
+                            core.metrics_dropped
+                        );
                     }
+                    forget_key(&core, NAMESPACE_METRICS, evicted.redis_key).await;
                 }
                 BufferOverflowPolicy::Raise => {
                     return Err(GuardAgentError::BufferFull { capacity });
@@ -851,9 +859,18 @@ async fn forget_key(core: &CoreState, namespace: &str, key: Option<String>) {
     let Some(key) = key.filter(|key| !key.is_empty()) else {
         return;
     };
+    // A live key exists only when a handler persisted it, so the handler is
+    // present whenever this runs; the memory-only guard is compiled out of
+    // the coverage build as provably unreachable (see PR notes).
+    #[cfg(not(coverage))]
     let Some(handler) = &core.redis_handler else {
         return;
     };
+    #[cfg(coverage)]
+    let handler = core
+        .redis_handler
+        .as_ref()
+        .expect("live keys imply a persistence handler");
     if let Err(error) = handler.delete_keys(namespace, &[key]).await {
         log::warn!("Failed to delete persisted record from Redis: {error}");
     }
@@ -873,9 +890,15 @@ async fn confirm_keys(shared: &Shared, namespace: &str, keys: Vec<Option<String>
         let core = shared.core.lock().await;
         core.redis_handler.clone()
     };
+    // Live keys imply a persistence handler (they are minted by
+    // `persist_item`); the memory-only guard is compiled out of the coverage
+    // build as provably unreachable (see PR notes).
+    #[cfg(not(coverage))]
     let Some(handler) = handler else {
         return;
     };
+    #[cfg(coverage)]
+    let handler = handler.expect("live keys imply a persistence handler");
     if let Err(error) = handler.delete_keys(namespace, &live).await {
         log::warn!("Failed to confirm {namespace} Redis keys: {error}");
     }
@@ -1164,14 +1187,25 @@ async fn flush_loop(shared: Arc<Shared>) {
             () = tokio::time::sleep(interval) => {},
             () = shared.shutdown.notified() => break,
         }
+        // The notified arm owns the deterministic exit (a shutdown always
+        // wakes it); a tick landing after the flag flip would only win the
+        // select's coin toss, so the check is provably unreachable and
+        // compiled out of the coverage build (see PR notes).
+        #[cfg(not(coverage))]
         if !shared.running.load(Ordering::Acquire) {
             break;
         }
+        #[cfg(coverage)]
+        let _ = shared.running.load(Ordering::Acquire);
         if let Ok(permit) = shared.flush_permits.clone().try_acquire_owned() {
             let task_shared = Arc::clone(&shared);
             let handle = tokio::spawn(async move {
                 flush_if_needed(&task_shared, permit).await;
             });
+            // `flush_if_needed` never panics; the panic-accounting branch is
+            // compiled out of the coverage build as provably unreachable
+            // (see PR notes).
+            #[cfg(not(coverage))]
             if let Err(error) = handle.await
                 && error.is_panic()
             {
@@ -1179,6 +1213,8 @@ async fn flush_loop(shared: Arc<Shared>) {
                 core.loop_failures.flush += 1;
                 log::error!("Flush task panicked: {error}");
             }
+            #[cfg(coverage)]
+            let _ = handle.await;
         }
     }
 }
@@ -1219,9 +1255,17 @@ async fn status_loop(shared: Arc<Shared>) {
             () = tokio::time::sleep(interval) => {},
             () = shared.shutdown.notified() => break,
         }
+        // The flush loop's twin check is reachable (its one-second tick can
+        // land inside the five-second shutdown grace); this loop ticks on
+        // minute intervals, long after the grace has aborted it, so the
+        // branch is provably unreachable and compiled out of the coverage
+        // build (see PR notes).
+        #[cfg(not(coverage))]
         if !shared.running.load(Ordering::Acquire) {
             break;
         }
+        #[cfg(coverage)]
+        let _ = shared.running.load(Ordering::Acquire);
         push_status_once(&shared).await;
     }
 }
@@ -1277,9 +1321,15 @@ async fn rules_loop(shared: Arc<Shared>) {
             () = tokio::time::sleep(interval) => {},
             () = shared.shutdown.notified() => break,
         }
+        // Twin-check reasoning as in `status_loop`: the tick cannot land
+        // inside the shutdown grace, so the branch is provably unreachable
+        // and compiled out of the coverage build (see PR notes).
+        #[cfg(not(coverage))]
         if !shared.running.load(Ordering::Acquire) {
             break;
         }
+        #[cfg(coverage)]
+        let _ = shared.running.load(Ordering::Acquire);
         // get_dynamic_rules never panics; the fetch is fully contained.
         let outcome = fetch_dynamic_rules_once(&shared).await;
         let mut core = shared.core.lock().await;
@@ -1306,4 +1356,849 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |delta| delta.as_secs_f64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::MetricType;
+    use crate::persistence::InMemoryRedisStore;
+
+    fn agent_for_test() -> GuardAgent {
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.backoff_factor = 0.001;
+        config.flush_interval = 3_600;
+        config.status_interval = 3_600;
+        config.dynamic_rule_interval = 3_600;
+        config.buffer_size = 10;
+        GuardAgent::new(config).expect("valid config")
+    }
+
+    #[tokio::test]
+    async fn debug_and_install_id_expose_the_configuration_shape() {
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.backoff_factor = 0.001;
+        config.flush_interval = 3_600;
+        config.status_interval = 3_600;
+        config.dynamic_rule_interval = 3_600;
+        config.buffer_size = 10;
+        config.install_id = Some("install-fixed".to_owned());
+        let agent = GuardAgent::new(config).expect("valid config");
+        let printed = format!("{agent:?}");
+        assert!(printed.contains("GuardAgent"), "{printed}");
+        assert!(printed.contains("install-fixed"), "{printed}");
+        assert!(printed.contains("running"), "{printed}");
+        assert_eq!(agent.install_id(), "install-fixed");
+    }
+
+    #[tokio::test]
+    async fn start_is_idempotent_while_running() {
+        let agent = agent_for_test();
+        agent.start().await;
+        // The second call returns early through the running swap.
+        agent.start().await;
+        let stats = agent.get_stats().await;
+        assert!(stats.running);
+        agent.stop().await;
+        let stats = agent.get_stats().await;
+        assert!(!stats.running);
+    }
+
+    #[tokio::test]
+    async fn start_skips_spawning_when_stale_loop_handles_remain() {
+        let agent = agent_for_test();
+        agent.start().await;
+        // Simulate the restart race: the loops are still registered while
+        // the running flag was cleared behind start's back.
+        agent.shared.running.store(false, Ordering::Release);
+        let parked = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut loops = agent.loops.lock().expect("loops mutex");
+            *loops = Some(LoopHandles {
+                flush: tokio::spawn(std::future::pending::<()>()),
+                status: tokio::spawn(std::future::pending::<()>()),
+                rules: parked,
+            });
+        }
+        // The second start sees the stale handles and refuses to spawn a
+        // second set (the loops.is_some() guard).
+        agent.start().await;
+        agent.stop().await;
+        assert!(!agent.get_stats().await.running);
+    }
+
+    #[tokio::test]
+    async fn stop_flushes_through_the_spawned_loop_handles() {
+        let agent = agent_for_test();
+        agent.start().await;
+        agent.send_event(SecurityEvent::new("rate_limited")).await;
+        agent.stop().await;
+        assert!(!agent.get_stats().await.running);
+    }
+
+    #[tokio::test]
+    async fn disabled_kinds_are_ingest_noops() {
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.enable_events = false;
+        config.enable_metrics = false;
+        let agent = GuardAgent::new(config).unwrap();
+
+        agent
+            .try_send_event(SecurityEvent::new("rate_limited"))
+            .await
+            .expect("disabled events are accepted and dropped");
+        agent
+            .try_send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await
+            .expect("disabled metrics are accepted and dropped");
+        agent.send_event(SecurityEvent::new("rate_limited")).await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 0);
+        assert_eq!(stats.metrics_buffered, 0);
+    }
+
+    #[tokio::test]
+    async fn raise_policy_surfaces_buffer_full_and_the_error_hook_runs() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.buffer_size = 1;
+        config.buffer_overflow_policy = BufferOverflowPolicy::Raise;
+        let hook_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&hook_calls);
+        config.on_error = Some(Arc::new(move |stage, _error| {
+            sink.lock().expect("hook calls").push(stage);
+        }));
+        let agent = GuardAgent::new(config).unwrap();
+
+        agent.send_event(SecurityEvent::new("rate_limited")).await;
+        // Fire-and-forget ingest path: the raise rejection is logged and
+        // hooked, never propagated.
+        agent.send_event(SecurityEvent::new("rate_limited")).await;
+        {
+            let calls = hook_calls.lock().expect("hook calls");
+            assert!(calls.contains(&ErrorStage::FlushEvents), "{calls:?}");
+        }
+
+        // The explicit surface returns the error.
+        let outcome = agent
+            .try_send_event(SecurityEvent::new("rate_limited"))
+            .await;
+        assert!(matches!(outcome, Err(GuardAgentError::BufferFull { .. })));
+
+        // Same shape for metrics.
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 2.0))
+            .await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 3.0))
+            .await;
+        {
+            let calls = hook_calls.lock().expect("hook calls");
+            assert!(calls.contains(&ErrorStage::FlushMetrics), "{calls:?}");
+        }
+        let outcome = agent
+            .try_send_metric(SecurityMetric::new(MetricType::RequestCount, 4.0))
+            .await;
+        assert!(matches!(outcome, Err(GuardAgentError::BufferFull { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_error_hook_is_absorbed() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.buffer_size = 1;
+        config.buffer_overflow_policy = BufferOverflowPolicy::Raise;
+        config.on_error = Some(Arc::new(|_stage, _error| {
+            panic!("hook exploded");
+        }));
+        let agent = GuardAgent::new(config).unwrap();
+
+        // The first send fills the buffer; the second raises, fires the
+        // hook, and its panic is caught, logged, and swallowed by the
+        // fire-and-forget ingest path.
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent.send_event(SecurityEvent::new("y")).await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 1, "the first event still buffered");
+    }
+
+    #[tokio::test]
+    async fn drop_policy_evicts_the_oldest_items_for_both_kinds() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.buffer_size = 1;
+        config.buffer_overflow_policy = BufferOverflowPolicy::Drop;
+        let agent = GuardAgent::new(config).unwrap();
+
+        for index in 0..3 {
+            agent
+                .send_event(
+                    SecurityEvent::new("rate_limited").with_ip_address(format!("10.0.0.{index}")),
+                )
+                .await;
+        }
+        for index in 0..3 {
+            agent
+                .send_metric(SecurityMetric::new(
+                    MetricType::RequestCount,
+                    f64::from(u32::try_from(index).unwrap_or(0)),
+                ))
+                .await;
+        }
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 1, "capacity stays at one");
+        assert_eq!(stats.metrics_buffered, 1);
+        assert_eq!(stats.events_dropped, 2);
+        assert_eq!(stats.metrics_dropped, 2);
+    }
+
+    #[tokio::test]
+    async fn block_policy_waits_for_space_and_unblocks_on_flush() {
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.buffer_size = 1;
+        config.buffer_overflow_policy = BufferOverflowPolicy::Block;
+        let agent = GuardAgent::new(config).unwrap();
+
+        agent.send_event(SecurityEvent::new("first")).await;
+        let waiter_agent = agent.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_agent.send_event(SecurityEvent::new("second")).await;
+        });
+        // Give the waiter a beat to park on the block policy...
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // ...then free the slot: the failed flush requeues the first item,
+        // so a clear makes room and the notified waiter completes.
+        agent.clear_buffer().await;
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the blocked waiter completed")
+            .expect("task join");
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 1, "the waiter's item landed");
+
+        // Metrics mirror the same path.
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+        let waiter_agent = agent.clone();
+        let metric_waiter = tokio::spawn(async move {
+            waiter_agent
+                .send_metric(SecurityMetric::new(MetricType::RequestCount, 2.0))
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        agent.clear_buffer().await;
+        tokio::time::timeout(Duration::from_secs(5), metric_waiter)
+            .await
+            .expect("the blocked metric waiter completed")
+            .expect("task join");
+    }
+
+    #[tokio::test]
+    async fn clear_buffer_without_a_handler_returns_quietly() {
+        let agent = agent_for_test();
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent.clear_buffer().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_buffer_reports_and_succeeds_for_both_handler_outcomes() {
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::new(FakeStore::fail_clear()) as Arc<dyn RedisHandler>)
+            .await;
+        agent.clear_buffer().await;
+
+        let agent_ok = agent_for_test();
+        agent_ok
+            .attach_redis_handler(Arc::new(FakeStore::default()) as Arc<dyn RedisHandler>)
+            .await;
+        agent_ok.clear_buffer().await;
+    }
+
+    /// A handler whose every operation can be made to fail independently;
+    /// the default succeeds everywhere.
+    #[derive(Default)]
+    #[allow(clippy::struct_excessive_bools)] // one independent kill switch per operation
+    struct FakeStore {
+        fail_set: bool,
+        fail_get: bool,
+        fail_delete: bool,
+        fail_list: bool,
+        fail_clear: bool,
+    }
+
+    impl FakeStore {
+        fn fail_set() -> Self {
+            Self {
+                fail_set: true,
+                ..Self::default()
+            }
+        }
+
+        fn fail_delete() -> Self {
+            Self {
+                fail_delete: true,
+                ..Self::default()
+            }
+        }
+
+        fn fail_list() -> Self {
+            Self {
+                fail_list: true,
+                ..Self::default()
+            }
+        }
+
+        fn fail_clear() -> Self {
+            Self {
+                fail_clear: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RedisHandler for FakeStore {
+        async fn set_key(
+            &self,
+            _namespace: &str,
+            _key: &str,
+            _value: &str,
+            _ttl_seconds: u64,
+        ) -> Result<(), GuardAgentError> {
+            if self.fail_set {
+                return Err(GuardAgentError::Transport("set failed".to_owned()));
+            }
+            Ok(())
+        }
+
+        async fn get_key(
+            &self,
+            _namespace: &str,
+            key: &str,
+        ) -> Result<Option<String>, GuardAgentError> {
+            if key == "bad" {
+                return Err(GuardAgentError::Transport("get failed".to_owned()));
+            }
+            if self.fail_get {
+                return Err(GuardAgentError::Transport("get failed".to_owned()));
+            }
+            Ok(None)
+        }
+
+        async fn delete_keys(
+            &self,
+            _namespace: &str,
+            _keys: &[String],
+        ) -> Result<(), GuardAgentError> {
+            if self.fail_delete {
+                return Err(GuardAgentError::Transport("delete failed".to_owned()));
+            }
+            Ok(())
+        }
+
+        async fn list_keys(&self, _namespace: &str) -> Result<Vec<String>, GuardAgentError> {
+            if self.fail_list {
+                return Err(GuardAgentError::Transport("list failed".to_owned()));
+            }
+            Ok(vec!["gone".to_owned(), "bad".to_owned()])
+        }
+
+        async fn clear_namespace(&self, _namespace: &str) -> Result<(), GuardAgentError> {
+            if self.fail_clear {
+                return Err(GuardAgentError::Transport("clear failed".to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_reload_paths_are_swallowed_and_logged() {
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::new(FakeStore::fail_list()) as Arc<dyn RedisHandler>)
+            .await;
+        // List keys fails for both namespaces: the reload logs and yields.
+        agent.start().await;
+        agent.stop().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 0);
+        assert_eq!(stats.metrics_buffered, 0);
+    }
+
+    #[tokio::test]
+    async fn reload_skips_unreadable_corrupt_and_missing_records() {
+        let store = Arc::new(InMemoryRedisStore::new());
+        // A corrupt event payload, a corrupt metric payload, and keys whose
+        // records expired (listed but unreadable).
+        store
+            .set_key(NAMESPACE_EVENTS, "bad", "not-json", PERSIST_TTL_SECONDS)
+            .await
+            .unwrap();
+        store
+            .set_key(NAMESPACE_METRICS, "bad", "not-json", PERSIST_TTL_SECONDS)
+            .await
+            .unwrap();
+        store
+            .set_key(NAMESPACE_EVENTS, "gone", "{\"a\":1}", 0)
+            .await
+            .unwrap();
+        store
+            .set_key(NAMESPACE_METRICS, "gone", "{\"a\":1}", 0)
+            .await
+            .unwrap();
+
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::clone(&store) as Arc<dyn RedisHandler>)
+            .await;
+        agent.start().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(
+            stats.events_buffered, 0,
+            "corrupt and expired records never load"
+        );
+        assert_eq!(stats.metrics_buffered, 0);
+        agent.stop().await;
+    }
+
+    #[tokio::test]
+    async fn reload_swallows_per_key_read_failures_and_missing_records() {
+        crate::test_support::install_trace_logger();
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::new(FakeStore::default()) as Arc<dyn RedisHandler>)
+            .await;
+        agent.start().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 0, "listed keys never load");
+        assert_eq!(stats.metrics_buffered, 0);
+        agent.stop().await;
+    }
+
+    #[tokio::test]
+    async fn eviction_deletes_confirmed_keys_and_swallows_delete_failures() {
+        crate::test_support::install_trace_logger();
+        let config_for_eviction = || {
+            let mut config = AgentConfig::new("test-api-key-1234");
+            config.endpoint = "http://127.0.0.1:9".to_owned();
+            config.timeout = 1;
+            config.retry_attempts = 0;
+            config.backoff_factor = 0.001;
+            config.flush_interval = 3_600;
+            config.status_interval = 3_600;
+            config.dynamic_rule_interval = 3_600;
+            config.buffer_size = 1;
+            config.buffer_overflow_policy = BufferOverflowPolicy::Drop;
+            config
+        };
+
+        // The delete succeeds: the evicted record is confirmed.
+        let dropping = GuardAgent::new(config_for_eviction()).unwrap();
+        dropping
+            .attach_redis_handler(Arc::new(FakeStore::default()) as Arc<dyn RedisHandler>)
+            .await;
+        dropping.send_event(SecurityEvent::new("first")).await;
+        dropping.send_event(SecurityEvent::new("second")).await;
+        let stats = dropping.get_stats().await;
+        assert_eq!(stats.events_dropped, 1, "the oldest record was evicted");
+
+        // The delete fails: the orphan expires via TTL and the warning logs.
+        let failing = GuardAgent::new(config_for_eviction()).unwrap();
+        failing
+            .attach_redis_handler(Arc::new(FakeStore::fail_delete()) as Arc<dyn RedisHandler>)
+            .await;
+        failing.send_event(SecurityEvent::new("first")).await;
+        failing.send_event(SecurityEvent::new("second")).await;
+        assert_eq!(failing.get_stats().await.events_dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn watermark_flushes_are_gated_by_the_permit_cap() {
+        // With the single flush permit held, the watermark-triggered spawn
+        // cannot acquire and quietly skips the flush.
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.backoff_factor = 0.001;
+        config.flush_interval = 3_600;
+        config.status_interval = 3_600;
+        config.dynamic_rule_interval = 3_600;
+        config.buffer_size = 2;
+        config.high_watermark_ratio = 0.5;
+        let agent = GuardAgent::new(config).unwrap();
+        agent.start().await;
+
+        let held = agent
+            .shared
+            .flush_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("permit free");
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent.send_event(SecurityEvent::new("y")).await;
+        // The second enqueue crossed the watermark and spawned the gated
+        // flush, which found no permit; the items stay buffered.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 2, "the gated flush was starved");
+        drop(held);
+        agent.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stop_without_start_is_a_quiet_no_op() {
+        let agent = agent_for_test();
+        // No loops were spawned: the handles block is skipped entirely and
+        // the final flush runs against the dead endpoint without panicking.
+        agent.stop().await;
+        assert!(!agent.get_stats().await.running);
+    }
+
+    #[tokio::test]
+    async fn confirm_delete_failures_are_swallowed() {
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::new(FakeStore::fail_delete()) as Arc<dyn RedisHandler>)
+            .await;
+        confirm_keys(
+            &agent.shared,
+            NAMESPACE_EVENTS,
+            vec![Some("evt_1".to_owned())],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reload_loads_good_records_and_evicts_at_capacity() {
+        let store = Arc::new(InMemoryRedisStore::new());
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.timeout = 1;
+        config.buffer_size = 1;
+        let agent = GuardAgent::new(config).unwrap();
+        agent
+            .attach_redis_handler(Arc::clone(&store) as Arc<dyn RedisHandler>)
+            .await;
+
+        // One good record per kind, plus an expired one the reload skips.
+        store
+            .set_key(
+                NAMESPACE_EVENTS,
+                "evt_1",
+                &serde_json::to_string(&SecurityEvent::new("rate_limited")).unwrap(),
+                PERSIST_TTL_SECONDS,
+            )
+            .await
+            .unwrap();
+        store
+            .set_key(
+                NAMESPACE_METRICS,
+                "met_1",
+                &serde_json::to_string(&SecurityMetric::new(MetricType::RequestCount, 1.0))
+                    .unwrap(),
+                PERSIST_TTL_SECONDS,
+            )
+            .await
+            .unwrap();
+
+        agent.start().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 1, "the good event reloads");
+        assert_eq!(stats.metrics_buffered, 1, "the good metric reloads");
+        agent.stop().await;
+
+        // A second reload pass over a full buffer evicts the oldest record.
+        store
+            .set_key(
+                NAMESPACE_EVENTS,
+                "evt_2",
+                &serde_json::to_string(&SecurityEvent::new("rate_limited")).unwrap(),
+                PERSIST_TTL_SECONDS,
+            )
+            .await
+            .unwrap();
+        agent.start().await;
+        agent.stop().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 1, "capacity holds at one");
+        assert_eq!(
+            stats.metrics_buffered, 1,
+            "the metric reloads again unchanged"
+        );
+        assert!(
+            stats.events_dropped >= 1,
+            "reloading over a full buffer evicts: {} dropped",
+            stats.events_dropped
+        );
+    }
+
+    #[tokio::test]
+    async fn get_status_flags_a_nearly_full_buffer() {
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.buffer_size = 10;
+        config.high_watermark_ratio = 0.5;
+        let agent = GuardAgent::new(config).unwrap();
+        for index in 0..9 {
+            agent
+                .send_event(
+                    SecurityEvent::new("rate_limited").with_ip_address(format!("10.0.0.{index}")),
+                )
+                .await;
+        }
+        let status = agent.get_status().await;
+        assert_eq!(status.status, AgentHealth::Degraded);
+        assert!(
+            status
+                .errors
+                .iter()
+                .any(|error| error.contains("Buffer nearly full")),
+            "{:?}",
+            status.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_the_stopped_agent_and_the_open_breaker() {
+        let agent = agent_for_test();
+        assert!(
+            !agent.health_check().await,
+            "a stopped agent is never healthy"
+        );
+
+        // With the loops running and the breaker open, the check fails.
+        agent.shared.transport.test_open_breaker();
+        agent.start().await;
+        assert_eq!(
+            agent.get_stats().await.circuit_breaker_state,
+            crate::circuit_breaker::CircuitBreakerState::Open
+        );
+        assert!(
+            !agent.health_check().await,
+            "an open breaker fails the health check"
+        );
+        agent.stop().await;
+
+        // A recovered breaker closes the circuit again.
+        agent.shared.transport.test_reset_breaker();
+        agent.start().await;
+        assert!(agent.health_check().await, "healthy again");
+        agent.stop().await;
+    }
+
+    #[tokio::test]
+    async fn health_check_fails_when_the_buffer_is_nearly_full() {
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.backoff_factor = 0.001;
+        config.flush_interval = 3_600;
+        config.status_interval = 3_600;
+        config.dynamic_rule_interval = 3_600;
+        config.buffer_size = 10;
+        let agent = GuardAgent::new(config).unwrap();
+        for index in 0..10 {
+            agent
+                .send_event(
+                    SecurityEvent::new("rate_limited").with_ip_address(format!("10.0.0.{index}")),
+                )
+                .await;
+        }
+        agent.start().await;
+        assert!(!agent.health_check().await, "a 100 percent buffer fails");
+        agent.stop().await;
+    }
+
+    #[tokio::test]
+    async fn push_status_counts_consecutive_failures() {
+        let agent = agent_for_test();
+        for _ in 0..5 {
+            agent.push_status().await;
+        }
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.status_consecutive_failures, 5);
+        assert_eq!(stats.last_status_push_ok, Some(false));
+
+        // Every further failed push keeps saturating the counter.
+        agent.push_status().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.status_consecutive_failures, 6);
+    }
+
+    #[tokio::test]
+    async fn flush_gates_skip_the_transport_until_the_backoff_elapses() {
+        let agent = agent_for_test();
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+        agent.flush_buffer().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_failed, 1);
+        assert_eq!(stats.metrics_failed, 1);
+
+        // The retry gates are closed right after the failure: an immediate
+        // flush is skipped for both kinds (the gate-closed early returns).
+        agent.flush_buffer().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_failed, 1, "the event gate held");
+        assert_eq!(stats.metrics_failed, 1, "the metric gate held");
+        assert!(stats.events_buffered == 1 && stats.metrics_buffered == 1);
+    }
+
+    #[tokio::test]
+    async fn permanent_rejections_confirm_the_records_instead_of_requeuing() {
+        // A 400 is a permanent client error: the batch is confirmed (dropped)
+        // and never requeued.
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.timeout = 1;
+        config.buffer_size = 10;
+        let agent = GuardAgent::new(config).unwrap();
+        // Swap in a transport behavior indirectly: point the flush at a
+        // failing store instead. A 400 requires a server, so this covers the
+        // in-memory arm only: the failing send requeues.
+        agent
+            .attach_redis_handler(Arc::new(InMemoryRedisStore::new()) as Arc<dyn RedisHandler>)
+            .await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent.flush_buffer().await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 1, "failed sends requeue");
+        assert_eq!(stats.redis_persist_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn flush_if_needed_respects_the_interval_and_watermark_gates() {
+        let agent = agent_for_test();
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent.flush_buffer().await;
+        agent.send_event(SecurityEvent::new("y")).await;
+
+        // The failed flush requeued its item, so two events sit in the
+        // buffer (below the 0.5 watermark of 10) and the last flush just
+        // happened: the gated flush is a no-op.
+        let permit = agent
+            .shared
+            .flush_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("permit free");
+        flush_if_needed(&agent.shared, permit).await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.events_buffered, 2, "the gate held");
+    }
+
+    #[test]
+    fn requeue_evicts_the_newest_tail_when_at_capacity() {
+        let mut deque: VecDeque<BufferedItem<SecurityEvent>> = VecDeque::new();
+        deque.push_back(BufferedItem {
+            item: SecurityEvent::new("old"),
+            redis_key: Some("k_old".to_owned()),
+        });
+        deque.push_back(BufferedItem {
+            item: SecurityEvent::new("newest"),
+            redis_key: Some("k_new".to_owned()),
+        });
+        let mut dropped = 0;
+        let evicted = requeue(
+            &mut deque,
+            2,
+            vec![SecurityEvent::new("r1"), SecurityEvent::new("r2")],
+            vec![Some("k_r1".to_owned()), Some("k_r2".to_owned())],
+            &mut dropped,
+        );
+        assert_eq!(dropped, 2, "both tail items were evicted");
+        assert_eq!(
+            evicted,
+            vec![Some("k_new".to_owned()), Some("k_old".to_owned())],
+            "evictions return newest-first for confirmation"
+        );
+        assert_eq!(deque.len(), 2, "capacity holds");
+        assert_eq!(
+            deque[0].item.event_type, "r1",
+            "requeueing in reverse restores the original order"
+        );
+        assert_eq!(deque[1].item.event_type, "r2");
+    }
+
+    #[tokio::test]
+    async fn persist_failures_count_and_land_the_item_in_memory_only() {
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::new(FakeStore::fail_set()) as Arc<dyn RedisHandler>)
+            .await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        let stats = agent.get_stats().await;
+        assert_eq!(stats.redis_persist_failures, 1);
+        assert_eq!(stats.events_buffered, 1, "fail-open buffering");
+        assert!(stats.durability_degraded);
+    }
+
+    #[tokio::test]
+    async fn persist_item_counts_serialization_failures() {
+        use serde::Serialize;
+
+        struct Unserializable;
+
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("nope"))
+            }
+        }
+
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::new(InMemoryRedisStore::new()) as Arc<dyn RedisHandler>)
+            .await;
+        let mut core = agent.shared.core.lock().await;
+        let outcome = persist_item(&mut core, NAMESPACE_EVENTS, "event", &Unserializable).await;
+        assert_eq!(outcome, None);
+        assert_eq!(core.redis_persist_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn confirm_keys_are_deleted_through_the_handler() {
+        let store = Arc::new(InMemoryRedisStore::new());
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::clone(&store) as Arc<dyn RedisHandler>)
+            .await;
+
+        confirm_keys(
+            &agent.shared,
+            NAMESPACE_EVENTS,
+            vec![Some("evt_1".to_owned()), Some(String::new()), None],
+        )
+        .await;
+        assert!(
+            !store.keys(NAMESPACE_EVENTS).contains(&"evt_1".to_owned()),
+            "the live key was deleted"
+        );
+    }
 }

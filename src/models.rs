@@ -494,6 +494,43 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn event_builders_cover_every_optional_field() {
+        let decorator = SecurityEvent::new("rate_limited")
+            .with_user_agent("guard-test/1.0")
+            .with_decorator_type("decorator")
+            .with_rule_type("rule")
+            .with_pattern_matched("pattern")
+            .with_handler_name("handler")
+            .with_idempotency_key(Uuid::nil());
+        assert_eq!(decorator.user_agent.as_deref(), Some("guard-test/1.0"));
+        assert_eq!(decorator.decorator_type.as_deref(), Some("decorator"));
+        assert_eq!(decorator.rule_type.as_deref(), Some("rule"));
+        assert_eq!(decorator.pattern_matched.as_deref(), Some("pattern"));
+        assert_eq!(decorator.handler_name.as_deref(), Some("handler"));
+        assert_eq!(decorator.idempotency_key, Uuid::nil());
+    }
+
+    #[test]
+    fn metric_type_display_matches_the_snake_case_labels() {
+        assert_eq!(MetricType::RequestCount.to_string(), "request_count");
+        assert_eq!(MetricType::BlockRate.to_string(), "block_rate");
+        assert_eq!(MetricType::CacheHitRate.to_string(), "cache_hit_rate");
+    }
+
+    #[test]
+    fn metric_builders_cover_tags_and_timestamp() {
+        let stamp = chrono::Utc::now();
+        let metric = SecurityMetric::new(MetricType::RequestCount, 1.0)
+            .with_tag("route", "/api/users")
+            .with_timestamp(stamp);
+        assert_eq!(
+            metric.tags.get("route").map(String::as_str),
+            Some("/api/users")
+        );
+        assert_eq!(metric.timestamp, stamp);
+    }
+
+    #[test]
     fn event_serializes_to_the_python_wire_shape() {
         let event = SecurityEvent::new("rate_limited")
             .with_ip_address("10.0.0.1")

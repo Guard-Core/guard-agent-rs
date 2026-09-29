@@ -134,6 +134,7 @@ mod tests {
         assert_eq!(ErrorStage::TransportSend.to_string(), "transport_send");
         assert_eq!(ErrorStage::FlushEvents.to_string(), "flush_events");
         assert_eq!(ErrorStage::FlushMetrics.to_string(), "flush_metrics");
+        assert_eq!(ErrorStage::Encryption.to_string(), "encryption");
     }
 
     #[test]

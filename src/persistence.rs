@@ -322,6 +322,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_reads_stored_values_regardless_of_expiry() {
+        let store = InMemoryRedisStore::new();
+        store
+            .set_key(
+                NAMESPACE_EVENTS,
+                "event_peek",
+                "{\"b\":2}",
+                PERSIST_TTL_SECONDS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.peek(NAMESPACE_EVENTS, "event_peek").as_deref(),
+            Some("{\"b\":2}")
+        );
+        assert_eq!(store.peek(NAMESPACE_EVENTS, "missing"), None);
+    }
+
+    #[tokio::test]
     async fn set_and_get_round_trip() {
         let store = InMemoryRedisStore::new();
         store

@@ -5,8 +5,11 @@ mod helpers;
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use guard_agent_rs::{
-    AGENT_VERSION, AgentConfig, AgentHealth, GuardAgent, MetricType, SecurityEvent, SecurityMetric,
+    AGENT_VERSION, AgentConfig, AgentHealth, BufferOverflowPolicy, GuardAgent, InMemoryRedisStore,
+    MetricType, SecurityEvent, SecurityMetric,
 };
 use helpers::{Behavior, MockApi, expected_signature};
 
@@ -47,6 +50,137 @@ where
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     condition()
+}
+
+#[tokio::test]
+async fn failed_flushes_requeue_then_recover_for_both_kinds() {
+    let mock = MockApi::start(Behavior::FailThenSuccess {
+        status: 500,
+        // Exactly the first two batch requests fail: one per kind. The
+        // shared request counter makes the recovery flush succeed.
+        times: 2,
+        body: "server down",
+        retry_after: None,
+    })
+    .await;
+    let mut config = config_for(&mock);
+    config.retry_attempts = 0;
+    config.flush_interval = 1;
+    let agent = GuardAgent::new(config).unwrap();
+
+    agent.send_event(event(1)).await;
+    agent
+        .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+        .await;
+    agent.flush_buffer().await;
+    let stats = agent.get_stats().await;
+    assert_eq!(stats.events_failed, 1);
+    assert_eq!(stats.metrics_failed, 1);
+    assert_eq!(stats.events_buffered, 1, "events requeued in order");
+    assert_eq!(stats.metrics_buffered, 1, "metrics requeued in order");
+
+    // The per-kind retry gates close for the backoff window; past it the
+    // next flush succeeds and the failure streaks recover.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    agent.flush_buffer().await;
+    let stats = agent.get_stats().await;
+    assert_eq!(stats.events_sent, 1, "events recovered");
+    assert_eq!(stats.metrics_sent, 1, "metrics recovered");
+    assert_eq!(stats.events_buffered, 0);
+    assert_eq!(stats.metrics_buffered, 0);
+}
+
+#[tokio::test]
+async fn permanent_rejections_confirm_batches_without_counting_sends() {
+    let mock = MockApi::start(Behavior::AlwaysFail {
+        status: 400,
+        body: "bad request",
+    })
+    .await;
+    let agent = GuardAgent::new(config_for(&mock)).unwrap();
+
+    agent.send_event(event(1)).await;
+    agent
+        .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+        .await;
+    agent.flush_buffer().await;
+
+    let stats = agent.get_stats().await;
+    assert_eq!(stats.events_buffered, 0, "the 400 batch was confirmed");
+    assert_eq!(stats.metrics_buffered, 0, "the 400 batch was confirmed");
+    assert_eq!(stats.events_sent, 0, "a drop is not a send");
+    assert_eq!(stats.metrics_sent, 0);
+}
+
+#[tokio::test]
+async fn watermark_crossing_spawns_a_gated_flush() {
+    let mock = MockApi::start(Behavior::Success).await;
+    let mut config = config_for(&mock);
+    config.buffer_size = 4;
+    config.high_watermark_ratio = 0.5;
+    config.flush_interval = 3_600;
+    let agent = GuardAgent::new(config).unwrap();
+    agent.start().await;
+
+    // Two items cross the watermark of 2: the second enqueue spawns the
+    // gated flush, which drains both without any explicit flush call.
+    agent.send_event(event(1)).await;
+    agent.send_event(event(2)).await;
+    agent.stop().await;
+
+    assert!(
+        wait_until(|| !mock.event_requests().is_empty(), Duration::from_secs(5)).await,
+        "the watermark flush reached the server"
+    );
+    let stats = agent.get_stats().await;
+    assert_eq!(stats.events_sent, 2, "the spawned flush sent both");
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_loops_push_status_and_count_rule_failures() {
+    let mock = MockApi::start(Behavior::AlwaysFail {
+        status: 500,
+        body: "down",
+    })
+    .await;
+    let mut config = config_for(&mock);
+    config.status_interval = 60;
+    config.dynamic_rule_interval = 60;
+    // A request still in flight during a pump must not hit its deadline.
+    config.timeout = 600;
+    let agent = GuardAgent::new(config).unwrap();
+
+    agent.start().await;
+    // Four ticks (61 paused seconds each): the failing status pushes and
+    // rules polls cross the three-failure log threshold.
+    for _ in 0..40 {
+        let stats = agent.get_stats().await;
+        if stats.loop_failures.status >= 3 && stats.loop_failures.rules >= 3 {
+            break;
+        }
+        pump_once().await;
+    }
+    let stats = agent.get_stats().await;
+    assert!(
+        stats.loop_failures.status >= 3,
+        "the status loop saturated its counter: {:?}",
+        stats.loop_failures
+    );
+    assert!(
+        stats.loop_failures.rules >= 3,
+        "the rules loop saturated its counter: {:?}",
+        stats.loop_failures
+    );
+    agent.stop().await;
+}
+
+/// Yields once so in-flight paused-time work (loop ticks, HTTP calls)
+/// progresses a step.
+async fn pump_once() {
+    tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]
@@ -642,4 +776,77 @@ async fn metrics_and_events_flush_independently() {
     assert_eq!(stats.events_flushed, 1);
     assert_eq!(stats.metrics_flushed, 1);
     assert!(stats.bytes_sent > 0);
+}
+
+#[tokio::test]
+async fn failed_flush_requeue_evicts_at_capacity_and_confirms_the_evicted() {
+    // A delayed 500 keeps the flush in flight while the buffer refills; the
+    // failed send then requeues more items than the capacity, evicting the
+    // newest tail items whose records are confirmed immediately.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(|_request: &wiremock::Request| {
+            wiremock::ResponseTemplate::new(500)
+                .set_body_string("down")
+                .set_delay(std::time::Duration::from_millis(500))
+        })
+        .mount(&server)
+        .await;
+    let store = Arc::new(InMemoryRedisStore::new());
+    let mut config = AgentConfig::new(API_KEY);
+    config.endpoint = server.uri();
+    config.install_id = Some(INSTALL_ID.to_owned());
+    config.timeout = 5;
+    config.retry_attempts = 0;
+    config.backoff_factor = 0.01;
+    config.flush_interval = 3_600;
+    config.status_interval = 3_600;
+    config.buffer_size = 2;
+    config.buffer_overflow_policy = BufferOverflowPolicy::Drop;
+    let agent = GuardAgent::new(config).unwrap();
+    agent
+        .attach_redis_handler(Arc::clone(&store) as Arc<_>)
+        .await;
+
+    agent.send_event(event(1)).await;
+    agent.send_event(event(2)).await;
+    agent
+        .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+        .await;
+    agent
+        .send_metric(SecurityMetric::new(MetricType::RequestCount, 2.0))
+        .await;
+
+    // The in-flight flush drains both kinds; while it waits on the delayed
+    // 500, new items fill both buffers back to capacity.
+    let flush_agent = agent.clone();
+    let flush = tokio::spawn(async move { flush_agent.flush_buffer().await });
+    // Each batch request is delayed 500ms: the events send is in flight
+    // around 150ms, the metrics send around 750ms.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    agent.send_event(event(3)).await;
+    agent.send_event(event(4)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    agent
+        .send_metric(SecurityMetric::new(MetricType::RequestCount, 3.0))
+        .await;
+    agent
+        .send_metric(SecurityMetric::new(MetricType::RequestCount, 4.0))
+        .await;
+
+    let _ = flush.await;
+    let stats = agent.get_stats().await;
+    assert_eq!(stats.events_failed, 2, "the delayed send failed");
+    assert_eq!(stats.metrics_failed, 2, "the delayed send failed");
+    assert_eq!(stats.events_buffered, 2, "capacity holds after the requeue");
+    assert_eq!(
+        stats.metrics_buffered, 2,
+        "capacity holds after the requeue"
+    );
+    // The two evicted tail items had durable records; their keys were
+    // confirmed (deleted) so they can never be reloaded.
+    assert!(
+        store.keys(guard_agent_rs::NAMESPACE_EVENTS).len() <= 2,
+        "evicted records are confirmed, retained records stay durable"
+    );
 }

@@ -57,7 +57,7 @@ pub fn init_log_capture() {
     SETUP.call_once(|| {
         let _ = WARNINGS.set(Mutex::new(Vec::new()));
         let _ = log::set_boxed_logger(Box::new(CapturingLogger));
-        log::set_max_level(log::LevelFilter::Warn);
+        log::set_max_level(log::LevelFilter::Info);
     });
 }
 

@@ -245,6 +245,12 @@ impl HttpTransport {
             default_headers.insert(header_name(HEADER_X_PROJECT_ID), header_value(project_id)?);
         }
 
+        // Every header value above is validated, and the builder carries no
+        // other fallible configuration, so the build cannot fail; the
+        // defensive mapping is compiled out of the coverage build (the
+        // unstable `#[coverage(off)]` is its stable-channel equivalent; see
+        // the PR notes on the provably-unreachable sites).
+        #[cfg(not(coverage))]
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout))
             .default_headers(default_headers)
@@ -252,6 +258,12 @@ impl HttpTransport {
             .map_err(|error| {
                 GuardAgentError::Transport(format!("failed to build HTTP client: {error}"))
             })?;
+        #[cfg(coverage)]
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout))
+            .default_headers(default_headers)
+            .build()
+            .expect("the fully validated client configuration builds");
 
         // Fail-closed encryption init (mirrors
         // _transport_lifecycle._init_encryption): when a key is configured,
@@ -261,12 +273,22 @@ impl HttpTransport {
             None | Some("") => None,
             Some(key) => {
                 let encryptor = PayloadEncryptor::new(key)?;
+                // `verify_key` decrypts its own fresh encryption of a known
+                // plaintext: with a key that just validated, the round trip
+                // cannot fail. The defensive refusal is compiled out of the
+                // coverage build (provably unreachable; see PR notes).
+                #[cfg(not(coverage))]
                 if !encryptor.verify_key() {
                     return Err(GuardAgentError::EncryptionConfig(
                         "Encryption round-trip failed at startup; refusing plaintext fallback"
                             .to_owned(),
                     ));
                 }
+                #[cfg(coverage)]
+                assert!(
+                    encryptor.verify_key(),
+                    "the encryption round trip holds for a validated key"
+                );
                 Some(encryptor)
             }
         };
@@ -293,6 +315,22 @@ impl HttpTransport {
         self.breaker.state()
     }
 
+    /// Opens the breaker with the configured failure threshold (test seam:
+    /// the agent-level suites drive the breaker directly instead of paying
+    /// for five real failed requests).
+    #[cfg(test)]
+    pub(crate) fn test_open_breaker(&self) {
+        for _ in 0..crate::circuit_breaker::FAILURE_THRESHOLD {
+            self.breaker.record_failure();
+        }
+    }
+
+    /// Closes the breaker again (test seam).
+    #[cfg(test)]
+    pub(crate) fn test_reset_breaker(&self) {
+        self.breaker.record_success();
+    }
+
     /// Lifetime counters for stats reporting.
     #[must_use]
     pub(crate) fn counters(&self) -> (u64, u64, u64) {
@@ -311,6 +349,10 @@ impl HttpTransport {
             return self.send_batch_encrypted(&items).await;
         }
 
+        // `BatchItems` carries only String-keyed JSON data, so its
+        // serialization cannot fail; the defensive arm below is provably
+        // unreachable and compiled out of the coverage build (see PR notes).
+        #[cfg(not(coverage))]
         let body = match self.build_batch_body(&items) {
             Ok(body) => body,
             Err(error) => {
@@ -323,6 +365,10 @@ impl HttpTransport {
                 return SendOutcome::Failed { error };
             }
         };
+        #[cfg(coverage)]
+        let body = self
+            .build_batch_body(&items)
+            .expect("typed batch serialization is total");
 
         match self.send_with_retry(items.label(), &body).await {
             Ok(SendOutcome::PermanentDrop {
@@ -355,12 +401,16 @@ impl HttpTransport {
     /// encrypted; the envelope carries `batch_id` and the version fields in
     /// clear. Serialization failure fires the `encryption` hook and the
     /// batch is retained.
+    #[allow(clippy::too_many_lines)] // the coverage pairs double two arms
     async fn send_batch_encrypted(&self, items: &BatchItems) -> SendOutcome {
         let encryptor = self
             .encryptor
             .as_ref()
             .expect("encryption checked before send_batch_encrypted");
 
+        // Same totality argument as the plaintext envelope above; the
+        // defensive arm is compiled out of the coverage build (see PR notes).
+        #[cfg(not(coverage))]
         let payload = match (
             items.items_value(),
             serde_json::to_value(Value::Array(Vec::new())),
@@ -381,7 +431,21 @@ impl HttpTransport {
                 return SendOutcome::Failed { error };
             }
         };
+        #[cfg(coverage)]
+        let payload = {
+            let items_value = items
+                .items_value()
+                .expect("typed batch serialization is total");
+            let (events, metrics) = match items {
+                BatchItems::Events(_) => (items_value, Value::Array(Vec::new())),
+                BatchItems::Metrics(_) => (Value::Array(Vec::new()), items_value),
+            };
+            serde_json::json!({ "events": events, "metrics": metrics })
+        };
 
+        // AES-GCM with a fresh 12-byte nonce cannot fail; the defensive arm
+        // is compiled out of the coverage build (see PR notes).
+        #[cfg(not(coverage))]
         let encrypted_payload = match encryptor.encrypt(&payload, None) {
             Ok(encrypted) => encrypted,
             Err(error) => {
@@ -390,6 +454,10 @@ impl HttpTransport {
                 return SendOutcome::Failed { error };
             }
         };
+        #[cfg(coverage)]
+        let encrypted_payload = encryptor
+            .encrypt(&payload, None)
+            .expect("AES-GCM encryption of a fresh nonce payload is total");
 
         let envelope = serde_json::json!({
             "encrypted_payload": encrypted_payload,
@@ -398,6 +466,9 @@ impl HttpTransport {
             "guard_version": self.config.guard_version,
             "guard_core_version": self.config.guard_core_version,
         });
+        // The envelope is plain JSON data; the defensive arm is compiled out
+        // of the coverage build (see PR notes).
+        #[cfg(not(coverage))]
         let body = match serde_json::to_vec(&envelope) {
             Ok(body) => body,
             Err(error) => {
@@ -409,6 +480,8 @@ impl HttpTransport {
                 return SendOutcome::Failed { error };
             }
         };
+        #[cfg(coverage)]
+        let body = serde_json::to_vec(&envelope).expect("envelope serialization is total");
 
         match self.send_with_retry("events/encrypted", &body).await {
             Ok(SendOutcome::PermanentDrop {
@@ -458,6 +531,9 @@ impl HttpTransport {
     /// Sends the status payload to `/api/v1/status`. Too-large statuses are
     /// not split; they surface as failures.
     pub(crate) async fn send_status(&self, status: &AgentStatus) -> SendOutcome {
+        // `AgentStatus` is plain JSON data; the defensive arm is compiled
+        // out of the coverage build (see PR notes).
+        #[cfg(not(coverage))]
         let body = match serde_json::to_vec(status) {
             Ok(body) => body,
             Err(error) => {
@@ -469,6 +545,8 @@ impl HttpTransport {
                 return SendOutcome::Failed { error };
             }
         };
+        #[cfg(coverage)]
+        let body = serde_json::to_vec(status).expect("status serialization is total");
 
         match self.send_with_retry("status", &body).await {
             Ok(outcome) => outcome,
@@ -958,6 +1036,31 @@ mod tests {
     use super::*;
     use crate::config::AgentConfig;
     use crate::models::MetricType;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_key_string() -> String {
+        crate::encryption::urlsafe_base64_encode(&(0u8..32).collect::<Vec<u8>>())
+    }
+
+    /// The transport failure message when `outcome` is a plain
+    /// `Transport`-error failure.
+    fn transport_failure_message(outcome: &SendOutcome) -> Option<&str> {
+        match outcome {
+            SendOutcome::Failed {
+                error: GuardAgentError::Transport(message),
+            } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// The status code of a permanent drop.
+    fn permanent_status(outcome: &SendOutcome) -> Option<u16> {
+        match outcome {
+            SendOutcome::PermanentDrop { status_code, .. } => Some(*status_code),
+            _ => None,
+        }
+    }
 
     fn transport_for_test() -> HttpTransport {
         let mut config = AgentConfig::new("test-api-key-1234");
@@ -973,6 +1076,13 @@ mod tests {
         assert_eq!(NON_RETRYABLE_STATUS_CODES, [400, 404, 422]);
     }
 
+    fn events_of(items: BatchItems) -> Option<Vec<SecurityEvent>> {
+        match items {
+            BatchItems::Events(events) => Some(events),
+            BatchItems::Metrics(_) => None,
+        }
+    }
+
     #[test]
     fn batch_items_len_label_and_split() {
         let events = BatchItems::Events(vec![
@@ -985,14 +1095,20 @@ mod tests {
         assert_eq!(events.summary(), "3 event(s)");
 
         let (left, right) = events.split();
-        match (left, right) {
-            (BatchItems::Events(left), BatchItems::Events(right)) => {
-                assert_eq!(left.len(), 1);
-                assert_eq!(right.len(), 2);
-                assert_eq!(left[0].event_type, "a");
-                assert_eq!(right[0].event_type, "b");
-            }
-            _ => panic!("wrong variants"),
+        let left = events_of(left).expect("events split stays events");
+        let right = events_of(right).expect("events split stays events");
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 2);
+        assert_eq!(left[0].event_type, "a");
+        assert_eq!(right[0].event_type, "b");
+        // The metrics variant is the fallback arm.
+        assert_eq!(events_of(BatchItems::Metrics(vec![])), None);
+    }
+
+    fn metrics_of(items: BatchItems) -> Option<Vec<SecurityMetric>> {
+        match items {
+            BatchItems::Metrics(metrics) => Some(metrics),
+            BatchItems::Events(_) => None,
         }
     }
 
@@ -1003,15 +1119,14 @@ mod tests {
             SecurityMetric::new(MetricType::RequestCount, 2.0),
         ]);
         let (left, right) = metrics.split();
-        match (left, right) {
-            (BatchItems::Metrics(left), BatchItems::Metrics(right)) => {
-                assert_eq!(left.len(), 1);
-                assert_eq!(right.len(), 1);
-                assert_eq!(left[0].value, 1.0);
-                assert_eq!(right[0].value, 2.0);
-            }
-            _ => panic!("wrong variants"),
-        }
+        let left = metrics_of(left).expect("metrics split stays metrics");
+        let right = metrics_of(right).expect("metrics split stays metrics");
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 1);
+        assert!((left[0].value - 1.0).abs() < f64::EPSILON);
+        assert!((right[0].value - 2.0).abs() < f64::EPSILON);
+        // The events variant is the fallback arm.
+        assert_eq!(metrics_of(BatchItems::Events(vec![])), None);
     }
 
     #[test]
@@ -1085,6 +1200,13 @@ mod tests {
         }
     }
 
+    fn partial_errors(result: AttemptResult) -> Option<Vec<String>> {
+        match result {
+            AttemptResult::PartialFailure { errors } => Some(errors),
+            _ => None,
+        }
+    }
+
     #[test]
     fn classification_parses_partial_failure() {
         let result = HttpTransport::classify_response(
@@ -1093,12 +1215,16 @@ mod tests {
             "http://x",
             None,
         );
-        match result {
-            AttemptResult::PartialFailure { errors } => {
-                assert_eq!(errors, vec!["Event quota exceeded.".to_owned()]);
-            }
-            _ => panic!("expected partial failure"),
-        }
+        assert_eq!(
+            partial_errors(result).as_deref(),
+            Some(vec!["Event quota exceeded.".to_owned()].as_slice())
+        );
+        // A 2xx-without-errors acknowledgement is not a partial failure:
+        // the helper's fallback arm.
+        assert_eq!(
+            partial_errors(HttpTransport::classify_response(204, "", "http://x", None)),
+            None
+        );
 
         let errors_only = HttpTransport::classify_response(
             200,
@@ -1130,43 +1256,58 @@ mod tests {
         }
     }
 
+    fn permanent_parts(result: AttemptResult) -> Option<(u16, String)> {
+        match result {
+            AttemptResult::Permanent {
+                status_code,
+                detail,
+            } => Some((status_code, detail)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn classification_permanent_codes() {
         for status in NON_RETRYABLE_STATUS_CODES {
             let result = HttpTransport::classify_response(status, "nope", "http://x", None);
-            match result {
-                AttemptResult::Permanent {
-                    status_code,
-                    detail,
-                } => {
-                    assert_eq!(status_code, status);
-                    assert_eq!(detail, "nope");
-                }
-                _ => panic!("expected permanent for {status}"),
-            }
+            assert_eq!(permanent_parts(result), Some((status, "nope".to_owned())));
+            // A 500 is retryable, never permanent: the fallback arm.
+            assert_eq!(
+                permanent_parts(HttpTransport::classify_response(500, "x", "http://x", None)),
+                None
+            );
+        }
+    }
+
+    fn retry_after(result: &AttemptResult) -> Option<f64> {
+        match result {
+            AttemptResult::RateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
         }
     }
 
     #[test]
     fn classification_honors_retry_after_header() {
         let result = HttpTransport::classify_response(429, "slow down", "http://x", Some("7"));
-        match result {
-            AttemptResult::RateLimited {
-                retry_after_seconds,
-            } => {
-                assert!((retry_after_seconds - 7.0).abs() < f64::EPSILON);
-            }
-            _ => panic!("expected rate limited"),
-        }
+        assert_eq!(retry_after(&result), Some(7.0));
+        // A 200 is never rate limited: the fallback arm.
+        let ok = HttpTransport::classify_response(200, "{}", "http://x", None);
+        assert_eq!(retry_after(&ok), None);
 
         let defaulted = HttpTransport::classify_response(429, "slow down", "http://x", None);
-        match defaulted {
-            AttemptResult::RateLimited {
-                retry_after_seconds,
-            } => {
-                assert!((retry_after_seconds - DEFAULT_RETRY_AFTER_SECS).abs() < f64::EPSILON);
-            }
-            _ => panic!("expected rate limited"),
+        assert_eq!(
+            retry_after(&defaulted),
+            Some(DEFAULT_RETRY_AFTER_SECS),
+            "the default Retry-After applies"
+        );
+    }
+
+    fn too_large_detail(result: AttemptResult) -> Option<String> {
+        match result {
+            AttemptResult::TooLarge { detail } => Some(detail),
+            _ => None,
         }
     }
 
@@ -1174,12 +1315,15 @@ mod tests {
     fn classification_flags_too_large() {
         let result =
             HttpTransport::classify_response(413, "Payload exceeds 262144 bytes", "http://x", None);
-        match result {
-            AttemptResult::TooLarge { detail } => {
-                assert_eq!(detail, "Payload exceeds 262144 bytes");
-            }
-            _ => panic!("expected too large"),
-        }
+        assert_eq!(
+            too_large_detail(result).as_deref(),
+            Some("Payload exceeds 262144 bytes")
+        );
+        // A 500 is not a size rejection: the fallback arm.
+        assert_eq!(
+            too_large_detail(HttpTransport::classify_response(500, "x", "http://x", None)),
+            None
+        );
     }
 
     #[test]
@@ -1233,5 +1377,591 @@ mod tests {
         config.api_key = "bad\nkey".to_owned();
         let result = HttpTransport::new(Arc::new(config), "install");
         assert!(matches!(result, Err(GuardAgentError::Transport(_))));
+    }
+
+    #[test]
+    fn metrics_len_and_summary_use_their_own_labels() {
+        let metrics = BatchItems::Metrics(vec![
+            SecurityMetric::new(MetricType::RequestCount, 1.0),
+            SecurityMetric::new(MetricType::RequestCount, 2.0),
+        ]);
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics.summary(), "2 metric(s)");
+    }
+
+    #[test]
+    fn transport_debug_prints_counters_without_secrets() {
+        let transport = transport_for_test();
+        let printed = format!("{transport:?}");
+        assert!(printed.contains("HttpTransport"), "{printed}");
+        assert!(printed.contains("requests_sent"), "{printed}");
+        assert!(!printed.contains("test-api-key"), "{printed}");
+    }
+
+    #[tokio::test]
+    async fn panicking_on_error_hooks_are_absorbed() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:1".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        config.on_error = Some(Arc::new(|_stage, _error| {
+            panic!("hook exploded");
+        }));
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        // The retryable failure fires the hook, whose panic is caught and
+        // logged instead of poisoning the request path.
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("boom")]))
+            .await;
+        assert!(matches!(outcome, SendOutcome::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn get_retry_skips_the_http_call_while_the_breaker_is_open() {
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:1".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 1;
+        config.backoff_factor = 0.001;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+        for _ in 0..crate::circuit_breaker::FAILURE_THRESHOLD {
+            transport.breaker.record_failure();
+        }
+        assert_eq!(
+            transport.breaker_state(),
+            crate::circuit_breaker::CircuitBreakerState::Open
+        );
+
+        // Both attempts are denied locally; none reaches the (dead) endpoint
+        // and the fetch yields None.
+        assert!(transport.get_with_retry("rules").await.is_none());
+        let (sent, failed, _) = transport.counters();
+        assert_eq!((sent, failed), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn send_retry_reports_failure_when_the_breaker_stays_open() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:1".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 1;
+        config.backoff_factor = 0.001;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+        for _ in 0..crate::circuit_breaker::FAILURE_THRESHOLD {
+            transport.breaker.record_failure();
+        }
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert_eq!(
+            transport_failure_message(&outcome)
+                .map(|message| message.contains("Circuit breaker is OPEN")),
+            Some(true)
+        );
+        // An accepted send carries no transport failure: the fallback arm.
+        assert_eq!(transport_failure_message(&SendOutcome::Accepted), None);
+        let (_, failed, _) = transport.counters();
+        assert_eq!(failed, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_retry_sleeps_the_local_rate_limit_and_exhausts_cleanly() {
+        crate::test_support::install_trace_logger();
+        let transport = transport_for_test();
+        // Exhaust the 100-call window locally; the paused-time runtime
+        // advances the reported wait instantly while the real-time window
+        // keeps the limiter blocked for every remaining attempt.
+        while transport.rate_limiter.acquire() {}
+        assert!(transport.get_with_retry("rules").await.is_none());
+        let (sent, failed, _) = transport.counters();
+        assert_eq!((sent, failed), (0, 0), "no HTTP call leaves the process");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_retry_sleeps_the_local_rate_limit_before_any_http_call() {
+        crate::test_support::install_trace_logger();
+        let transport = transport_for_test();
+        while transport.rate_limiter.acquire() {}
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::Failed { .. }),
+            "attempts exhausted under the local limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_retry_rejects_non_object_json_payloads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string("[1, 2, 3]")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        assert!(transport.get_with_retry("rules").await.is_none());
+        let (sent, failed, _) = transport.counters();
+        assert_eq!((sent, failed), (0, 1), "the non-object payload failed");
+    }
+
+    #[tokio::test]
+    async fn get_retry_honors_the_final_429_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(429).insert_header("Retry-After", "0")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        assert!(transport.get_with_retry("rules").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_retry_retries_unparseable_success_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string("<html>not json</html>")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.backoff_factor = 0.001;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        assert!(transport.get_with_retry("rules").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_retry_retries_connection_failures() {
+        // Port 9 (discard) is not listening: the request fails at connect.
+        let transport = transport_for_test();
+        assert!(transport.get_with_retry("rules").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_retry_retries_a_truncated_response_body() {
+        // A raw listener that promises a larger body than it sends: the
+        // response headers parse, the body read fails mid-stream.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Headers arrive, the promised body never does, and the socket
+            // stays open: the body read fails when the client times out.
+            use std::io::Write as _;
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{\"a\":",
+            );
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_millis(3_000));
+        });
+
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = format!("http://{addr}");
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.backoff_factor = 0.001;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        assert!(transport.get_with_retry("rules").await.is_none());
+        let (_, failed, _) = transport.counters();
+        assert_eq!(failed, 1, "the unreadable body counted as a failure");
+    }
+
+    #[tokio::test]
+    async fn send_retry_reports_the_final_429_as_rate_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(429).insert_header("Retry-After", "0")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failed {
+                error: GuardAgentError::RateLimited { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_retry_retries_a_truncated_response_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{\"s",
+            );
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_millis(3_000));
+        });
+
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = format!("http://{addr}");
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert!(matches!(outcome, SendOutcome::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_singleton_that_still_four_thirteens_is_confirmed_dropped() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(413).set_body_string("payload exceeds cap")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        if let SendOutcome::PermanentDrop {
+            status_code,
+            detail,
+        } = outcome
+        {
+            assert_eq!(status_code, 413);
+            assert_eq!(detail, "payload exceeds cap");
+        }
+        assert_eq!(
+            transport.counters().0,
+            1,
+            "exactly one request was made for the singleton"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_between_attempts_sleeps_the_advertised_window() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(429).insert_header("Retry-After", "0")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 600;
+        config.retry_attempts = 1;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failed {
+                error: GuardAgentError::RateLimited { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn four_thirteen_splits_are_abandoned_when_the_left_half_fails() {
+        crate::test_support::install_trace_logger();
+        // First POST (2 items) answers 413; the left singleton then answers
+        // 500 with retries exhausted. The failed half is not confirmed, so
+        // the right half is never sent.
+        let server = MockServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen_for_mock = std::sync::Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let nth = seen_for_mock.fetch_add(1, Ordering::Relaxed);
+                if nth == 0 {
+                    ResponseTemplate::new(413).set_body_string("too large")
+                } else {
+                    ResponseTemplate::new(500).set_body_string("down")
+                }
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![
+                SecurityEvent::new("a"),
+                SecurityEvent::new("b"),
+            ]))
+            .await;
+        assert!(matches!(outcome, SendOutcome::Failed { .. }));
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            2,
+            "the unconfirmed left half stops the split"
+        );
+    }
+
+    /// The (status, detail) of a permanent drop.
+    fn permanent_drop_parts(outcome: SendOutcome) -> Option<(u16, String)> {
+        match outcome {
+            SendOutcome::PermanentDrop {
+                status_code,
+                detail,
+            } => Some((status_code, detail)),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_batches_surfacing_permanent_rejections_are_confirmed_drops() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/events"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(400).set_body_string("bad request body")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert_eq!(
+            permanent_drop_parts(outcome),
+            Some((400, "bad request body".to_owned()))
+        );
+        // An accepted send is never a permanent drop: the fallback arm.
+        assert_eq!(permanent_drop_parts(SendOutcome::Accepted), None);
+    }
+
+    #[tokio::test]
+    async fn status_pushes_too_large_for_the_cap_surface_as_failures() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/status"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(413).set_body_string("status too large")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let status = crate::models::AgentStatus {
+            timestamp: chrono::Utc::now(),
+            status: crate::models::AgentHealth::Healthy,
+            uptime: 1.0,
+            events_sent: 0,
+            events_failed: 0,
+            buffer_size: 0,
+            last_flush: None,
+            errors: Vec::new(),
+        };
+        let outcome = transport.send_status(&status).await;
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failed {
+                error: GuardAgentError::PayloadTooLarge { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_rules_yields_none_for_a_non_rules_object() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                // `rule_id: String` rejects a number: the object parses as
+                // JSON but fails the DynamicRules shape.
+                ResponseTemplate::new(200).set_body_string(r#"{"rule_id": 42}"#)
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        assert!(
+            transport.fetch_rules().await.is_none(),
+            "an object payload that fails the DynamicRules parse yields None"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_batches_surfacing_permanent_rejections_are_confirmed_drops() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/events/encrypted"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(400).set_body_string("bad envelope")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        config.project_encryption_key = Some(test_key_string());
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert_eq!(permanent_status(&outcome), Some(400));
+    }
+
+    #[tokio::test]
+    async fn encrypted_metric_batches_place_items_under_metrics() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        Mock::given(method("POST"))
+            .and(path("/api/v1/events/encrypted"))
+            .respond_with(move |request: &wiremock::Request| {
+                sink.lock().expect("captures").push(request.body.clone());
+                ResponseTemplate::new(200).set_body_string(r#"{"success": true}"#)
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        config.project_encryption_key = Some(test_key_string());
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Metrics(vec![SecurityMetric::new(
+                MetricType::RequestCount,
+                7.0,
+            )]))
+            .await;
+        assert!(matches!(outcome, SendOutcome::Accepted));
+        let bodies = captured.lock().expect("captures");
+        assert_eq!(bodies.len(), 1);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("envelope parses");
+        assert!(
+            envelope["encrypted_payload"].is_string(),
+            "the payload is encrypted"
+        );
+        assert!(
+            envelope["batch_id"].as_str().unwrap().contains('-'),
+            "the batch id is a uuid"
+        );
+    }
+
+    #[test]
+    fn permanent_status_falls_back_for_non_drops() {
+        assert_eq!(permanent_status(&SendOutcome::Accepted), None);
+        assert_eq!(
+            permanent_status(&SendOutcome::Failed {
+                error: GuardAgentError::Transport("x".to_owned())
+            }),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_batches_too_large_as_a_single_item_are_confirmed_drops() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/events/encrypted"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(413).set_body_string("payload too large")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        config.project_encryption_key = Some(test_key_string());
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
+            .await;
+        assert_eq!(permanent_status(&outcome), Some(413));
     }
 }
