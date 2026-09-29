@@ -56,6 +56,9 @@ tokio    = { version = "1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+# cargo-llvm-cov compiles with `--cfg coverage` (its stable-channel hook for
+# excluding provably unreachable defensive arms; see the guarded sites).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [lints.clippy]
 all                      = { level = "deny", priority = -1 }
