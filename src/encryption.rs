@@ -283,6 +283,32 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_rejects_aes_valid_plaintext_that_is_not_json() {
+        use aes_gcm::aead::Aead as _;
+
+        let encryptor = PayloadEncryptor::new(&test_key()).unwrap();
+        // A payload whose AES-GCM envelope is perfectly valid but whose
+        // plaintext is not JSON: the authenticated decryption succeeds and
+        // the JSON parse is what fails.
+        let nonce_bytes = [7u8; NONCE_SIZE];
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let sealed = encryptor
+            .cipher
+            .encrypt(nonce, b"not json at all".as_slice())
+            .expect("AES-GCM encryption of a fresh nonce payload is total");
+        let mut combined = Vec::with_capacity(NONCE_SIZE + sealed.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&sealed);
+
+        let encrypted = urlsafe_base64_encode(&combined);
+        let outcome = encryptor.decrypt(&encrypted, None);
+        assert!(matches!(
+            outcome,
+            Err(GuardAgentError::Encryption(message)) if message.contains("Invalid or tampered")
+        ));
+    }
+
+    #[test]
     fn canonical_json_covers_scalars_and_control_escapes() {
         assert_eq!(canonical_json(&serde_json::Value::Bool(false)), "false");
         assert_eq!(canonical_json(&serde_json::Value::Null), "null");

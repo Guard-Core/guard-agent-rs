@@ -358,15 +358,20 @@ async fn failed_polls_are_counted_as_consecutive_loop_failures() {
 
     agent.start().await;
     pump().await;
-    let mut failed = false;
+    // Pump past STATUS_LOG_ERROR_THRESHOLD (3 consecutive failures) so the
+    // rules loop escalates its log from a warning to an error.
+    let mut saturated = false;
     for _ in 0..100 {
-        if agent.get_stats().await.loop_failures.rules >= 1 {
-            failed = true;
+        if agent.get_stats().await.loop_failures.rules >= 3 {
+            saturated = true;
             break;
         }
         pump().await;
     }
-    assert!(failed, "rules loop failures must be counted in stats");
+    assert!(
+        saturated,
+        "rules loop failures must saturate the error threshold"
+    );
     assert!(!agent.get_stats().await.cached_rules);
     agent.stop().await;
 }

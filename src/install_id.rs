@@ -193,4 +193,15 @@ mod tests {
         let again = resolve_install_id_from(&path, None);
         assert_eq!(id, again);
     }
+
+    #[test]
+    fn parentless_path_skips_the_directory_setup_and_degrades() {
+        crate::test_support::install_trace_logger();
+
+        // The empty path has no parent, so the create_dir_all arm is
+        // skipped entirely and the bare write fails with NotFound,
+        // degrading to a fresh in-memory id without touching the cwd.
+        let id = resolve_install_id_from(Path::new(""), None);
+        assert_eq!(id.len(), 36, "persist failure degrades to in-memory");
+    }
 }

@@ -1420,6 +1420,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_panicking_on_error_hook_observes_the_transport_failure() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:1".to_owned();
+        config.timeout = 1;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&hook_calls);
+        config.on_error = Some(Arc::new(move |_stage, _error| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        // The retryable failure fires the hook, which returns normally, so
+        // the panic-absorption arm takes its implicit else.
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("boom")]))
+            .await;
+        assert!(matches!(outcome, SendOutcome::Failed { .. }));
+        assert_eq!(
+            hook_calls.load(Ordering::Relaxed),
+            1,
+            "the hook observed exactly one failure"
+        );
+    }
+
+    #[tokio::test]
     async fn get_retry_skips_the_http_call_while_the_breaker_is_open() {
         let mut config = AgentConfig::new("test-api-key-1234");
         config.endpoint = "http://127.0.0.1:1".to_owned();
@@ -1497,6 +1525,190 @@ mod tests {
             matches!(outcome, SendOutcome::Failed { .. }),
             "attempts exhausted under the local limiter"
         );
+    }
+
+    #[tokio::test]
+    async fn get_attempt_reports_non_429_client_errors_as_retryable() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(500).set_body_string("boom")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        assert!(transport.get_with_retry("rules").await.is_none());
+        let (sent, failed, _) = transport.counters();
+        assert_eq!((sent, failed), (0, 1), "the server error failed the fetch");
+    }
+
+    #[tokio::test]
+    async fn get_retry_retries_a_mid_attempt_429_with_retry_after() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "<set-below>".to_owned();
+        config.timeout = 2;
+        config.retry_attempts = 1;
+        config.compression_enabled = false;
+        let server = MockServer::start().await;
+        config.endpoint = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(429).insert_header("Retry-After", "0")
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string("{\"rule_id\": \"ok\"}")
+            })
+            .mount(&server)
+            .await;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let rules = transport
+            .get_with_retry("rules")
+            .await
+            .expect("rules after retry");
+        assert_eq!(rules["rule_id"], "ok");
+        let (sent, failed, _) = transport.counters();
+        assert_eq!((sent, failed), (1, 0), "only the successful attempt counts");
+    }
+
+    #[tokio::test]
+    async fn get_retry_retries_a_mid_attempt_server_error_with_backoff() {
+        crate::test_support::install_trace_logger();
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "<set-below>".to_owned();
+        config.timeout = 2;
+        config.retry_attempts = 1;
+        config.backoff_factor = 0.001;
+        config.compression_enabled = false;
+        let server = MockServer::start().await;
+        config.endpoint = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(503).set_body_string("down")
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"rule_id\": \"back\", \"version\": 1}")
+            })
+            .mount(&server)
+            .await;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let rules = transport
+            .get_with_retry("rules")
+            .await
+            .expect("rules after backoff");
+        assert_eq!(rules["rule_id"], "back");
+    }
+
+    #[tokio::test]
+    async fn send_retry_reports_partial_failure_outcomes() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/events"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"success\": true, \"errors\": [\"row-2\"]}")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("partial")]))
+            .await;
+        let message = transport_failure_message(&outcome);
+        assert!(
+            message.is_some_and(|message| message.contains("partial failure")),
+            "expected a partial-failure outcome, got {outcome:?} ({message:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_two_item_batch_that_four_thirteens_confirms_both_singletons() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(413).set_body_string("payload exceeds cap")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        // The pair splits into singletons; each still 413s, so each is
+        // permanently dropped, and the left half's confirmation drives the
+        // right half through the same path.
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![
+                SecurityEvent::new("left"),
+                SecurityEvent::new("right"),
+            ]))
+            .await;
+        assert!(matches!(
+            outcome,
+            SendOutcome::PermanentDrop {
+                status_code: 413,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn signed_payloads_carry_the_signature_header() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/events"))
+            .respond_with(|_request: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string("{\"success\": true}")
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        config.payload_signing_secret = Some("signing-secret".to_owned());
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![SecurityEvent::new("signed")]))
+            .await;
+        assert!(matches!(outcome, SendOutcome::Accepted));
     }
 
     #[tokio::test]
@@ -1653,7 +1865,6 @@ mod tests {
             .await;
         assert!(matches!(outcome, SendOutcome::Failed { .. }));
     }
-
     #[tokio::test]
     async fn a_singleton_that_still_four_thirteens_is_confirmed_dropped() {
         crate::test_support::install_trace_logger();
@@ -1674,14 +1885,16 @@ mod tests {
         let outcome = transport
             .send_batch(BatchItems::Events(vec![SecurityEvent::new("x")]))
             .await;
-        if let SendOutcome::PermanentDrop {
-            status_code,
-            detail,
-        } = outcome
-        {
-            assert_eq!(status_code, 413);
-            assert_eq!(detail, "payload exceeds cap");
-        }
+        assert!(
+            matches!(
+                outcome,
+                SendOutcome::PermanentDrop {
+                    status_code: 413,
+                    ref detail,
+                } if detail == "payload exceeds cap"
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
         assert_eq!(
             transport.counters().0,
             1,

@@ -79,6 +79,19 @@ async fn failed_flushes_requeue_then_recover_for_both_kinds() {
     assert_eq!(stats.events_buffered, 1, "events requeued in order");
     assert_eq!(stats.metrics_buffered, 1, "metrics requeued in order");
 
+    // An immediate second flush hits both closed retry gates and quietly
+    // keeps everything buffered.
+    agent.flush_buffer().await;
+    let stats = agent.get_stats().await;
+    assert_eq!(
+        stats.events_buffered, 1,
+        "the closed event gate kept the item"
+    );
+    assert_eq!(
+        stats.metrics_buffered, 1,
+        "the closed metric gate kept the item"
+    );
+
     // The per-kind retry gates close for the backoff window; past it the
     // next flush succeeds and the failure streaks recover.
     tokio::time::sleep(Duration::from_millis(1_300)).await;

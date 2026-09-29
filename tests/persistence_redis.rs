@@ -69,6 +69,29 @@ async fn raw_keys(conn: &mut redis::aio::MultiplexedConnection, pattern: &str) -
     keys
 }
 
+#[tokio::test]
+async fn start_is_idempotent_and_works_without_redis() {
+    // A configuration without Redis covers the memory-only start path, and
+    // the second start returns early on both idempotence guards.
+    let mut config = AgentConfig::new(API_KEY);
+    config.endpoint = String::from("http://127.0.0.1:9");
+    config.install_id = Some("install-redis-test".to_owned());
+    config.timeout = 1;
+    config.retry_attempts = 0;
+    config.flush_interval = 3_600;
+    config.status_interval = 3_600;
+    let agent = GuardAgent::new(config).unwrap();
+    agent.start().await;
+    agent.start().await;
+    let stats = agent.get_stats().await;
+    assert!(stats.running, "the agent is running");
+    agent.stop().await;
+    // After a stop the loops handle still exists, so a restart takes the
+    // reuse-them early return instead of spawning duplicates.
+    agent.start().await;
+    agent.stop().await;
+}
+
 async fn wait_until<F>(mut condition: F, deadline: Duration) -> bool
 where
     F: FnMut() -> bool,

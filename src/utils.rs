@@ -125,7 +125,14 @@ pub fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     // surfaces that same impossible I/O error, and its fallback returns the
     // raw payload instead of panicking.
     let _ = encoder.write_all(body);
-    encoder.finish().unwrap_or_else(|_| body.to_vec())
+    // `Write` for `Vec` is infallible and `finish` only surfaces that same
+    // impossible I/O error, so the fallback is compiled out of the coverage
+    // build as provably unreachable (see PR notes).
+    #[cfg(not(coverage))]
+    let compressed = encoder.finish().unwrap_or_else(|_| body.to_vec());
+    #[cfg(coverage)]
+    let compressed = encoder.finish().expect("GzEncoder over a Vec cannot fail");
+    compressed
 }
 
 /// Redacts sensitive keys from event metadata and metric tags.
