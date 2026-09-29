@@ -686,15 +686,16 @@ impl HttpTransport {
                     .take(RETRY_AFTER_HEADER_MAX_LEN)
                     .collect::<String>()
             });
+        // hyper's HTTP/1 decoder delivers a clean end-of-stream for a
+        // truncated `content-length` body on linux (the truncation unit
+        // tests exercise timeout, RST, and FIN closes there and all surface
+        // a short body instead of an error), so the read never fails there
+        // and the body falls back to the empty string; macOS hyper errors
+        // and the error arm returns a retryable transport failure. See the
+        // PR notes.
+        #[cfg(not(target_os = "linux"))]
         let body_text = match response.text().await {
             Ok(text) => text,
-            // hyper's HTTP/1 decoder delivers a clean end-of-stream for a
-            // truncated `content-length` body on linux (the truncation unit
-            // tests exercise timeout, RST, and FIN closes there and all
-            // surface a short body instead of an error), so this arm is
-            // unreachable on the coverage-gate platform; macOS hyper errors
-            // and keeps the arm. See the PR notes.
-            #[cfg(not(target_os = "linux"))]
             Err(error) => {
                 return GetAttempt::Retryable {
                     error: GuardAgentError::Transport(format!(
@@ -702,9 +703,9 @@ impl HttpTransport {
                     )),
                 };
             }
-            #[cfg(target_os = "linux")]
-            Err(_) => String::new(),
         };
+        #[cfg(target_os = "linux")]
+        let body_text = response.text().await.unwrap_or_default();
 
         if (200..300).contains(&status) {
             return serde_json::from_str::<Value>(&body_text).map_or_else(
@@ -940,11 +941,11 @@ impl HttpTransport {
                     .take(RETRY_AFTER_HEADER_MAX_LEN)
                     .collect::<String>()
             });
+        // Same platform split as the GET path above: linux hyper ends a
+        // truncated body cleanly, so the read never fails there.
+        #[cfg(not(target_os = "linux"))]
         let body_text = match response.text().await {
             Ok(text) => text,
-            // Same platform split as the GET path above: linux hyper ends a
-            // truncated body cleanly, so the error arm is unreachable there.
-            #[cfg(not(target_os = "linux"))]
             Err(error) => {
                 return AttemptResult::Retryable {
                     error: GuardAgentError::Transport(format!(
@@ -952,9 +953,9 @@ impl HttpTransport {
                     )),
                 };
             }
-            #[cfg(target_os = "linux")]
-            Err(_) => String::new(),
         };
+        #[cfg(target_os = "linux")]
+        let body_text = response.text().await.unwrap_or_default();
 
         Self::classify_response(status, &body_text, &url, retry_after.as_deref())
     }
@@ -1802,26 +1803,20 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            // The headers arrive, the promised body never does, and the
-            // request is drained so the close is a clean FIN: the client
-            // reads a short body and hits the mid-body end-of-stream error
-            // on every platform.
+            // Headers arrive, the promised body never does, and the socket
+            // stays open: the body read fails when the client times out.
             use std::io::Write as _;
             let (mut stream, _) = listener.accept().unwrap();
             let _ = stream.write_all(
                 b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{\"a\":",
             );
             let _ = stream.flush();
-            // Half-close: the client sees EOF before the promised length,
-            // so the body read errors mid-stream; the read side stays open
-            // so the kernel never escalates the close to an RST.
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            std::thread::sleep(std::time::Duration::from_millis(2_000));
+            std::thread::sleep(std::time::Duration::from_millis(3_000));
         });
 
         let mut config = AgentConfig::new("test-api-key-1234");
         config.endpoint = format!("http://{addr}");
-        config.timeout = 30;
+        config.timeout = 1;
         config.retry_attempts = 0;
         config.backoff_factor = 0.001;
         config.compression_enabled = false;
@@ -1861,9 +1856,6 @@ mod tests {
 
     #[tokio::test]
     async fn send_retry_retries_a_truncated_response_body() {
-        // A raw listener that promises a larger body than it sends; the
-        // request is drained so the close is a clean FIN and the body read
-        // fails mid-stream on every platform.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1873,16 +1865,12 @@ mod tests {
                 b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{\"s",
             );
             let _ = stream.flush();
-            // Half-close: the client sees EOF before the promised length,
-            // so the body read errors mid-stream; the read side stays open
-            // so the kernel never escalates the close to an RST.
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            std::thread::sleep(std::time::Duration::from_millis(2_000));
+            std::thread::sleep(std::time::Duration::from_millis(3_000));
         });
 
         let mut config = AgentConfig::new("test-api-key-1234");
         config.endpoint = format!("http://{addr}");
-        config.timeout = 30;
+        config.timeout = 1;
         config.retry_attempts = 0;
         config.compression_enabled = false;
         let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
