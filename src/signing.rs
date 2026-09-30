@@ -10,7 +10,9 @@
 //! fails verification whenever compression is active; this crate deliberately
 //! signs the plaintext body and documents the difference.
 
-use hmac::{Hmac, Mac as _};
+// `KeyInit` (re-exported by hmac 0.13) is what provides `new_from_slice`;
+// `Mac` provides `update`/`finalize`.
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
 use std::fmt::Write as _;
 

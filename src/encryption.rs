@@ -163,7 +163,9 @@ impl PayloadEncryptor {
     ) -> Result<String, crate::error::GuardAgentError> {
         let plaintext = canonical_json(data);
         let nonce_bytes = rand_bytes(NONCE_SIZE);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        // Infallible: `rand_bytes` always returns exactly `NONCE_SIZE` bytes
+        // (hybrid-array deprecated `from_slice` in favor of `TryFrom`).
+        let nonce = Nonce::try_from(&nonce_bytes[..]).expect("nonce is always 12 bytes");
         // AES-GCM with a fresh 12-byte nonce cannot fail; the defensive
         // mapping is compiled out of the coverage build as provably
         // unreachable (see PR notes).
@@ -171,7 +173,7 @@ impl PayloadEncryptor {
         let ciphertext = self
             .cipher
             .encrypt(
-                nonce,
+                &nonce,
                 associated_data.map_or_else(
                     || plaintext.as_bytes().into(),
                     |aad| aes_gcm::aead::Payload {
@@ -189,7 +191,7 @@ impl PayloadEncryptor {
         let ciphertext = self
             .cipher
             .encrypt(
-                nonce,
+                &nonce,
                 associated_data.map_or_else(
                     || plaintext.as_bytes().into(),
                     |aad| aes_gcm::aead::Payload {
@@ -231,11 +233,14 @@ impl PayloadEncryptor {
         let (ciphertext, tag) = ciphertext.split_at(ciphertext.len() - 16);
         let mut tagged = ciphertext.to_vec();
         tagged.extend_from_slice(tag);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        // Infallible: the length guard above plus `split_at(NONCE_SIZE)` make
+        // the slice exactly `NONCE_SIZE` bytes (hybrid-array deprecated
+        // `from_slice` in favor of `TryFrom`).
+        let nonce = Nonce::try_from(nonce_bytes).expect("nonce is always 12 bytes");
         let plaintext = self
             .cipher
             .decrypt(
-                nonce,
+                &nonce,
                 associated_data.map_or_else(
                     || tagged.as_slice().into(),
                     |aad| aes_gcm::aead::Payload {
@@ -262,7 +267,9 @@ impl PayloadEncryptor {
 
 /// Collects `len` random bytes for a nonce from the OS entropy source.
 fn rand_bytes(len: usize) -> Vec<u8> {
-    use rand::RngCore;
+    // rand 0.10 folded `fill_bytes` into the root `Rng` trait (`RngCore`
+    // is no longer re-exported at the crate root).
+    use rand::Rng as _;
     let mut bytes = vec![0u8; len];
     rand::rng().fill_bytes(&mut bytes);
     bytes
@@ -292,10 +299,10 @@ mod tests {
         // plaintext is not JSON: the authenticated decryption succeeds and
         // the JSON parse is what fails.
         let nonce_bytes = [7u8; NONCE_SIZE];
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let sealed = encryptor
             .cipher
-            .encrypt(nonce, b"not json at all".as_slice())
+            .encrypt(&nonce, b"not json at all".as_slice())
             .expect("AES-GCM encryption of a fresh nonce payload is total");
         let mut combined = Vec::with_capacity(NONCE_SIZE + sealed.len());
         combined.extend_from_slice(&nonce_bytes);

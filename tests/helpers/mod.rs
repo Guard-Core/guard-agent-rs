@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use log::{Level, Metadata, Record};
 use sha2::Sha256;
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
