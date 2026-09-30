@@ -317,8 +317,131 @@ impl RedisHandler for RedisClientHandler {
 mod tests {
     use super::*;
 
+    /// The malformed URL fails at `redis::Client::open` before any I/O.
+    #[cfg(feature = "persistence")]
+    #[tokio::test]
+    async fn connect_rejects_malformed_urls_without_io() {
+        let config = crate::config::RedisConfig {
+            url: "not-a-redis-url".to_owned(),
+            key_prefix: "guard".to_owned(),
+            command_timeout_ms: 1_000,
+        };
+        let outcome = RedisClientHandler::connect(&config).await;
+        assert!(matches!(outcome, Err(GuardAgentError::Redis(_))));
+    }
+
+    /// A listener that completes the client's SETINFO handshake and then
+    /// goes silent drives the first real command through its timeout arm.
+    #[cfg(feature = "persistence")]
+    #[tokio::test]
+    async fn query_times_out_against_a_silent_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("the client connects");
+            let mut buffer = [0u8; 1024];
+            // Answer the best-effort SETINFO handshake (errors are ignored
+            // by the client), then stop responding entirely.
+            loop {
+                let read = stream.read(&mut buffer).expect("socket read");
+                let handshake = buffer[..read]
+                    .windows(7)
+                    .filter(|w| w == b"SETINFO")
+                    .count();
+                if handshake == 0 {
+                    break;
+                }
+                for _ in 0..handshake {
+                    let _ = stream.write_all(b"-ERR unknown command\r\n");
+                }
+                let _ = stream.flush();
+            }
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        });
+        let config = crate::config::RedisConfig {
+            url: format!("redis://{addr}"),
+            key_prefix: "guard".to_owned(),
+            command_timeout_ms: 50,
+        };
+        let handler = RedisClientHandler::connect(&config)
+            .await
+            .expect("the handshake completes");
+        let outcome = handler.get_key(NAMESPACE_EVENTS, "slow").await;
+        assert!(
+            matches!(&outcome, Err(GuardAgentError::Redis(message)) if message.contains("timed out")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A listener that answers the first real command with a RESP error
+    /// surfaces that error through the query arm.
+    #[cfg(feature = "persistence")]
+    #[tokio::test]
+    async fn query_surfaces_resp_errors_from_the_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("the client connects");
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("socket read");
+                // SETINFO handshake chunks get error replies the client
+                // tolerates; every later chunk (a real command) gets the
+                // RESP error this test is about.
+                let handshake = buffer[..read]
+                    .windows(7)
+                    .filter(|w| w == b"SETINFO")
+                    .count();
+                for _ in 0..handshake {
+                    let _ = stream.write_all(b"-ERR unknown command\r\n");
+                }
+                if handshake == 0 {
+                    let _ = stream.write_all(b"-ERR mocked failure\r\n");
+                    let _ = stream.flush();
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                } else {
+                    let _ = stream.flush();
+                }
+            }
+        });
+        let config = crate::config::RedisConfig {
+            url: format!("redis://{addr}"),
+            key_prefix: "guard".to_owned(),
+            command_timeout_ms: 2_000,
+        };
+        let handler = RedisClientHandler::connect(&config)
+            .await
+            .expect("the handshake completes");
+        let outcome = handler.get_key(NAMESPACE_EVENTS, "boom").await;
+        assert!(
+            matches!(outcome, Err(GuardAgentError::Redis(_))),
+            "{outcome:?}"
+        );
+    }
+
     async fn stored_keys(store: &InMemoryRedisStore, namespace: &str) -> Vec<String> {
         store.list_keys(namespace).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn peek_reads_stored_values_regardless_of_expiry() {
+        let store = InMemoryRedisStore::new();
+        store
+            .set_key(
+                NAMESPACE_EVENTS,
+                "event_peek",
+                "{\"b\":2}",
+                PERSIST_TTL_SECONDS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.peek(NAMESPACE_EVENTS, "event_peek").as_deref(),
+            Some("{\"b\":2}")
+        );
+        assert_eq!(store.peek(NAMESPACE_EVENTS, "missing"), None);
     }
 
     #[tokio::test]

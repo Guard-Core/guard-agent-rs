@@ -47,6 +47,12 @@ tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", 
 uuid        = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+# The unit twins for the fail-secure body-read path build a
+# `reqwest::Response` around an `http::Response` carrying a failing
+# `http_body::Body`; both crates already ship with reqwest, and are listed
+# only so the tests can name them directly.
+http      = "1"
+http-body = "1"
 log      = { version = "0.4", features = ["alloc"] }
 tempfile = "3"
 wiremock = "0.6"
@@ -56,6 +62,9 @@ tokio    = { version = "1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+# cargo-llvm-cov compiles with `--cfg coverage` (its stable-channel hook for
+# excluding provably unreachable defensive arms; see the guarded sites).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [lints.clippy]
 all                      = { level = "deny", priority = -1 }

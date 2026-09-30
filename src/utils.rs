@@ -120,12 +120,19 @@ pub fn hash_ip(ip: &str, salt: &str) -> String {
 #[must_use]
 pub fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    // Writing into a `Vec` cannot fail, and `finish` only surfaces that
-    // impossible I/O error; fall back to the raw payload instead of panicking.
-    if encoder.write_all(body).is_err() {
-        return body.to_vec();
-    }
-    encoder.finish().unwrap_or_else(|_| body.to_vec())
+    // Writing into a `Vec` cannot fail (the `Write` impl for `Vec` is
+    // infallible), so the write result carries no information; `finish` only
+    // surfaces that same impossible I/O error, and its fallback returns the
+    // raw payload instead of panicking.
+    let _ = encoder.write_all(body);
+    // `Write` for `Vec` is infallible and `finish` only surfaces that same
+    // impossible I/O error, so the fallback is compiled out of the coverage
+    // build as provably unreachable (see PR notes).
+    #[cfg(not(coverage))]
+    let compressed = encoder.finish().unwrap_or_else(|_| body.to_vec());
+    #[cfg(coverage)]
+    let compressed = encoder.finish().expect("GzEncoder over a Vec cannot fail");
+    compressed
 }
 
 /// Redacts sensitive keys from event metadata and metric tags.

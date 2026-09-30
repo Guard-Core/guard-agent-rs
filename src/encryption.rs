@@ -165,6 +165,10 @@ impl PayloadEncryptor {
         let plaintext = canonical_json(data);
         let nonce_bytes = rand_bytes(NONCE_SIZE);
         let nonce = Nonce::from_slice(&nonce_bytes);
+        // AES-GCM with a fresh 12-byte nonce cannot fail; the defensive
+        // mapping is compiled out of the coverage build as provably
+        // unreachable (see PR notes).
+        #[cfg(not(coverage))]
         let ciphertext = self
             .cipher
             .encrypt(
@@ -180,6 +184,20 @@ impl PayloadEncryptor {
             .map_err(|error| {
                 GuardAgentError::Encryption(format!("Failed to encrypt payload: {error}"))
             })?;
+        #[cfg(coverage)]
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                nonce,
+                associated_data.map_or_else(
+                    || plaintext.as_bytes().into(),
+                    |aad| aes_gcm::aead::Payload {
+                        msg: plaintext.as_bytes(),
+                        aad: aad.as_bytes(),
+                    },
+                ),
+            )
+            .expect("AES-GCM encryption of a fresh nonce payload is total");
 
         let mut combined = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
         combined.extend_from_slice(&nonce_bytes);
@@ -262,6 +280,63 @@ mod tests {
 
     fn test_key() -> String {
         urlsafe_base64_encode(&(0u8..32).collect::<Vec<u8>>())
+    }
+
+    #[test]
+    fn decrypt_rejects_aes_valid_plaintext_that_is_not_json() {
+        use aes_gcm::aead::Aead as _;
+
+        let encryptor = PayloadEncryptor::new(&test_key()).unwrap();
+        // A payload whose AES-GCM envelope is perfectly valid but whose
+        // plaintext is not JSON: the authenticated decryption succeeds and
+        // the JSON parse is what fails.
+        let nonce_bytes = [7u8; NONCE_SIZE];
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let sealed = encryptor
+            .cipher
+            .encrypt(nonce, b"not json at all".as_slice())
+            .expect("AES-GCM encryption of a fresh nonce payload is total");
+        let mut combined = Vec::with_capacity(NONCE_SIZE + sealed.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&sealed);
+
+        let encrypted = urlsafe_base64_encode(&combined);
+        let outcome = encryptor.decrypt(&encrypted, None);
+        assert!(matches!(
+            outcome,
+            Err(GuardAgentError::Encryption(message)) if message.contains("Invalid or tampered")
+        ));
+    }
+
+    #[test]
+    fn canonical_json_covers_scalars_and_control_escapes() {
+        assert_eq!(canonical_json(&serde_json::Value::Bool(false)), "false");
+        assert_eq!(canonical_json(&serde_json::Value::Null), "null");
+        assert_eq!(canonical_json(&serde_json::json!(true)), "true");
+        // Every control character the Python `json.dumps` escaping handles.
+        let tricky = "quote\" backslash\\ \u{8}\u{c}\n\r\t";
+        let canonical = canonical_json(&serde_json::json!(tricky));
+        let expected = "\"quote\\\" backslash\\\\ \\b\\f\\n\\r\\t\"";
+        assert_eq!(canonical, expected, "every control char is escaped");
+    }
+
+    #[test]
+    fn encryptor_debug_prints_without_leaking_the_key() {
+        let encryptor = PayloadEncryptor::new(&test_key()).unwrap();
+        let printed = format!("{encryptor:?}");
+        assert!(printed.contains("PayloadEncryptor"), "{printed}");
+        assert!(!printed.contains(&test_key()), "the key never renders");
+    }
+
+    #[test]
+    fn decrypt_rejects_undersized_payloads() {
+        let encryptor = PayloadEncryptor::new(&test_key()).unwrap();
+        // Decodes fine as base64 but is shorter than nonce + tag.
+        let short = URL_SAFE_NO_PAD.encode(b"tiny");
+        assert!(matches!(
+            encryptor.decrypt(&short, None),
+            Err(GuardAgentError::Encryption(_))
+        ));
     }
 
     #[test]

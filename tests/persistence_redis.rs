@@ -69,6 +69,29 @@ async fn raw_keys(conn: &mut redis::aio::MultiplexedConnection, pattern: &str) -
     keys
 }
 
+#[tokio::test]
+async fn start_is_idempotent_and_works_without_redis() {
+    // A configuration without Redis covers the memory-only start path, and
+    // the second start returns early on both idempotence guards.
+    let mut config = AgentConfig::new(API_KEY);
+    config.endpoint = String::from("http://127.0.0.1:9");
+    config.install_id = Some("install-redis-test".to_owned());
+    config.timeout = 1;
+    config.retry_attempts = 0;
+    config.flush_interval = 3_600;
+    config.status_interval = 3_600;
+    let agent = GuardAgent::new(config).unwrap();
+    agent.start().await;
+    agent.start().await;
+    let stats = agent.get_stats().await;
+    assert!(stats.running, "the agent is running");
+    agent.stop().await;
+    // After a stop the loops handle still exists, so a restart takes the
+    // reuse-them early return instead of spawning duplicates.
+    agent.start().await;
+    agent.stop().await;
+}
+
 async fn wait_until<F>(mut condition: F, deadline: Duration) -> bool
 where
     F: FnMut() -> bool,
@@ -240,6 +263,52 @@ async fn partial_failure_warning_mentions_redis_retention_with_redis() {
         warning.contains("requeued in memory and retained in Redis (events) for retry"),
         "warning must mention Redis retention when a Redis handler is attached: {warning}"
     );
+
+    agent.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Redis on 127.0.0.1:6379; run with: cargo test --all-features -- --include-ignored"]
+async fn clear_buffer_wipes_the_persisted_namespaces() {
+    let prefix = format!("guard-agent-rs-test:{}", uuid::Uuid::new_v4());
+    let mut config = failing_agent_config(&prefix);
+    config.endpoint = String::from("http://127.0.0.1:9");
+    let agent = GuardAgent::new(config).unwrap();
+    agent.start().await;
+
+    for index in 0..2 {
+        agent.send_event(event(index)).await;
+    }
+    agent
+        .send_metric(guard_agent_rs::SecurityMetric::new(
+            guard_agent_rs::MetricType::RequestCount,
+            1.0,
+        ))
+        .await;
+
+    let mut conn = raw_connection().await;
+    assert!(
+        !raw_keys(&mut conn, &format!("{prefix}:agent_events:*"))
+            .await
+            .is_empty(),
+        "events persisted before the clear"
+    );
+
+    agent.clear_buffer().await;
+
+    assert!(
+        raw_keys(&mut conn, &format!("{prefix}:agent_events:*"))
+            .await
+            .is_empty(),
+        "clear_namespace wiped the events namespace"
+    );
+    assert!(
+        raw_keys(&mut conn, &format!("{prefix}:agent_metrics:*"))
+            .await
+            .is_empty(),
+        "clear_namespace wiped the metrics namespace"
+    );
+    assert_eq!(agent.get_stats().await.events_buffered, 0);
 
     agent.stop().await;
 }
