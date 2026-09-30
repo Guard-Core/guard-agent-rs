@@ -161,7 +161,6 @@ impl PayloadEncryptor {
         data: &Value,
         associated_data: Option<&str>,
     ) -> Result<String, crate::error::GuardAgentError> {
-        use crate::error::GuardAgentError;
         let plaintext = canonical_json(data);
         let nonce_bytes = rand_bytes(NONCE_SIZE);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -182,7 +181,9 @@ impl PayloadEncryptor {
                 ),
             )
             .map_err(|error| {
-                GuardAgentError::Encryption(format!("Failed to encrypt payload: {error}"))
+                crate::error::GuardAgentError::Encryption(format!(
+                    "Failed to encrypt payload: {error}"
+                ))
             })?;
         #[cfg(coverage)]
         let ciphertext = self
