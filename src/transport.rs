@@ -16,7 +16,11 @@
 //! - 413 triggers binary split-or-drop: the batch is halved and each half
 //!   retried recursively; a singleton that still 413s is dropped;
 //! - 401, 403, other 4xx, 5xx, and network errors are retryable with
-//!   exponential backoff under the circuit breaker.
+//!   exponential backoff under the circuit breaker;
+//! - a failed response-body read is retryable on every platform
+//!   (fail-secure): an unreadable body is never classified from an empty
+//!   string, so a send whose response body was lost mid-read (timeout, RST,
+//!   TLS truncation) is retried, never counted as accepted.
 //!
 //! One deliberate difference from the Python and TypeScript agents: the HMAC
 //! signature covers the uncompressed JSON body (see [`crate::signing`]).
@@ -686,14 +690,21 @@ impl HttpTransport {
                     .take(RETRY_AFTER_HEADER_MAX_LEN)
                     .collect::<String>()
             });
-        // hyper's HTTP/1 decoder delivers a clean end-of-stream for a
-        // truncated `content-length` body on linux (the truncation unit
-        // tests exercise timeout, RST, and FIN closes there and all surface
-        // a short body instead of an error), so the read never fails there
-        // and the body falls back to the empty string; macOS hyper errors
-        // and the error arm returns a retryable transport failure. See the
-        // PR notes.
-        #[cfg(not(target_os = "linux"))]
+        // Fail-secure on every platform: a body read that fails (timeout,
+        // RST mid-body, TLS truncation) is a retryable transport failure,
+        // never an empty string to classify from.
+        Self::classify_get_attempt(response, status, url, retry_after).await
+    }
+
+    /// Classifies one GET response: reads the body, then maps the status
+    /// onto the outcome. A failed body read is always retryable: telemetry
+    /// must not be classified from a body that was never received.
+    async fn classify_get_attempt(
+        response: reqwest::Response,
+        status: u16,
+        url: &str,
+        retry_after: Option<String>,
+    ) -> GetAttempt {
         let body_text = match response.text().await {
             Ok(text) => text,
             Err(error) => {
@@ -704,8 +715,6 @@ impl HttpTransport {
                 };
             }
         };
-        #[cfg(target_os = "linux")]
-        let body_text = response.text().await.unwrap_or_default();
 
         if (200..300).contains(&status) {
             return serde_json::from_str::<Value>(&body_text).map_or_else(
@@ -941,9 +950,22 @@ impl HttpTransport {
                     .take(RETRY_AFTER_HEADER_MAX_LEN)
                     .collect::<String>()
             });
-        // Same platform split as the GET path above: linux hyper ends a
-        // truncated body cleanly, so the read never fails there.
-        #[cfg(not(target_os = "linux"))]
+        // Fail-secure on every platform, same rule as the GET path: a body
+        // read that fails is a retryable transport failure, never an empty
+        // string to classify from.
+        Self::classify_attempt(response, status, &url, retry_after.as_deref()).await
+    }
+
+    /// Classifies one POST response: reads the body, then maps the status
+    /// onto the attempt outcome. A failed body read is always retryable:
+    /// telemetry must not be counted as accepted (or rate limited, or
+    /// permanently rejected) from a body that was never received.
+    async fn classify_attempt(
+        response: reqwest::Response,
+        status: u16,
+        url: &str,
+        retry_after: Option<&str>,
+    ) -> AttemptResult {
         let body_text = match response.text().await {
             Ok(text) => text,
             Err(error) => {
@@ -954,10 +976,7 @@ impl HttpTransport {
                 };
             }
         };
-        #[cfg(target_os = "linux")]
-        let body_text = response.text().await.unwrap_or_default();
-
-        Self::classify_response(status, &body_text, &url, retry_after.as_deref())
+        Self::classify_response(status, &body_text, url, retry_after)
     }
 
     /// Applies the compression threshold, mirroring the Python agent.
@@ -1048,11 +1067,89 @@ impl HttpTransport {
 mod tests {
     #![allow(clippy::float_cmp)]
 
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use super::*;
     use crate::config::AgentConfig;
     use crate::models::MetricType;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A response body whose read always fails: the in-process twin of a
+    /// connection that dies mid-body (read timeout, RST, TLS truncation).
+    /// The wire-level truncation tests cannot force a mid-body read error
+    /// deterministically on linux (hyper delivers a clean end-of-stream for
+    /// a truncated `content-length` body there), so the classification
+    /// twins below drive the production read-and-classify code path with
+    /// this body type instead, on every platform.
+    struct FailingBody;
+
+    impl http_body::Body for FailingBody {
+        type Data = &'static [u8];
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(Some(Err(std::io::Error::other(
+                "connection reset while reading the response body",
+            ))))
+        }
+    }
+
+    /// Builds a response whose body read always fails, without touching the
+    /// network; the failed read surfaces as a real `reqwest::Error` from
+    /// `Response::text`, exactly as it does over the wire.
+    fn response_with_failing_body(status: u16) -> reqwest::Response {
+        let response = http::Response::builder()
+            .status(status)
+            .body(reqwest::Body::wrap(FailingBody))
+            .unwrap();
+        reqwest::Response::from(response)
+    }
+
+    #[tokio::test]
+    async fn get_body_read_failure_is_retryable_not_an_empty_rule_set() {
+        // A 429 whose body cannot be read must not be classified as a clean
+        // rate limit from an empty string.
+        let attempt = HttpTransport::classify_get_attempt(
+            response_with_failing_body(429),
+            429,
+            "http://unit.test/api/v1/rules",
+            None,
+        )
+        .await;
+        let is_transport_retryable = matches!(
+            attempt,
+            GetAttempt::Retryable {
+                error: GuardAgentError::Transport(_)
+            }
+        );
+        assert!(is_transport_retryable);
+    }
+
+    #[tokio::test]
+    async fn send_body_read_failure_is_retryable_not_an_accepted_send() {
+        // A 201 whose body cannot be read must count as a retryable
+        // failure, never as an accepted send (telemetry must not be
+        // silently lost).
+        let result = HttpTransport::classify_attempt(
+            response_with_failing_body(201),
+            201,
+            "http://unit.test/api/v1/events",
+            None,
+        )
+        .await;
+        let is_transport_retryable = matches!(
+            result,
+            AttemptResult::Retryable {
+                error: GuardAgentError::Transport(_)
+            }
+        );
+        assert!(is_transport_retryable);
+    }
 
     fn test_key_string() -> String {
         crate::encryption::urlsafe_base64_encode(&(0u8..32).collect::<Vec<u8>>())

@@ -725,6 +725,8 @@ dependencies = [
  "chrono",
  "flate2",
  "hmac",
+ "http",
+ "http-body",
  "log",
  "rand 0.9.5",
  "redis",
