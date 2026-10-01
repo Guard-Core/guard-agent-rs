@@ -15,7 +15,7 @@
 //!
 //! - [`InMemoryRedisStore`], always available, useful for tests and for
 //!   embedding.
-//! - [`RedisClientHandler`], behind the `persistence` feature, wrapping the
+//! - `RedisClientHandler`, behind the `persistence` feature, wrapping the
 //!   `redis` crate's multiplexed async connection.
 //!
 //! Callers may also implement [`RedisHandler`] themselves and attach it with
@@ -532,7 +532,10 @@ mod tests {
             .unwrap();
 
         store.clear_namespace(NAMESPACE_EVENTS).await.unwrap();
-        assert!(stored_keys(&store, NAMESPACE_EVENTS).await.is_empty());
+        assert_eq!(
+            stored_keys(&store, NAMESPACE_EVENTS).await,
+            Vec::<String>::new()
+        );
         assert_eq!(
             stored_keys(&store, NAMESPACE_METRICS).await,
             vec!["b".to_owned()]
@@ -563,7 +566,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(stored_keys(&store, NAMESPACE_EVENTS).await.is_empty());
+        assert_eq!(
+            stored_keys(&store, NAMESPACE_EVENTS).await,
+            Vec::<String>::new()
+        );
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
     }

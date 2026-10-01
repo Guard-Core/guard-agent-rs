@@ -8,7 +8,7 @@ The agent buffers security events, metrics, and status reports in memory, ships 
 
 ## Status
 
-Released. Version 3.1.0, published to crates.io.
+Released. Version 3.2.0, published to crates.io.
 
 ## Features
 

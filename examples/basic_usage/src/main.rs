@@ -1,13 +1,13 @@
-//! Command basic_usage wires guard-agent-rs into an application the way a
+//! Command `basic_usage` wires guard-agent-rs into an application the way a
 //! production service would: an engine or adapter middleware translates each
 //! block verdict into a `SecurityEvent`, the agent buffers it and ships it
 //! to the Guard Core App ingestion API, and shutdown performs a final flush.
 //!
-//! Set GUARD_AGENT_API_KEY (required), GUARD_AGENT_PROJECT_ID,
-//! GUARD_AGENT_SIGNING_SECRET (optional, enables HMAC signing), and
-//! GUARD_AGENT_ENDPOINT (optional, defaults to the ingestion API) before
+//! Set `GUARD_AGENT_API_KEY` (required), `GUARD_AGENT_PROJECT_ID`,
+//! `GUARD_AGENT_SIGNING_SECRET` (optional, enables HMAC signing), and
+//! `GUARD_AGENT_ENDPOINT` (optional, defaults to the ingestion API) before
 //! running. Optional persistence (feature `persistence`):
-//! GUARD_AGENT_REDIS_URL.
+//! `GUARD_AGENT_REDIS_URL`.
 //!
 //! Wiring path note: guard-core-rs does not expose a telemetry hook seam
 //! yet (no `OnBlock` equivalent; the facade re-exports the detection
@@ -87,11 +87,11 @@ fn block_event(
     status_code: u16,
 ) -> SecurityEvent {
     let mut event = SecurityEvent::new("suspicious_request");
-    event.ip_address = ip_address.to_owned();
+    ip_address.clone_into(&mut event.ip_address);
     event.endpoint = Some(endpoint.to_owned());
     event.method = Some(method.to_owned());
-    event.action_taken = "BLOCKED".to_owned();
-    event.reason = reason.to_owned();
+    "BLOCKED".clone_into(&mut event.action_taken);
+    reason.clone_into(&mut event.reason);
     event.status_code = Some(status_code);
     event
 }
