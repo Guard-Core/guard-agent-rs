@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-10-01
+
+Hardening and coverage release: the fail-secure response-body read restored on every platform, a 100% line coverage gate on CI, and the crypto and utility stack brought current.
+
+### Added
+
+- **100% line coverage gate** (`.github/workflows/ci.yml`): cargo-llvm-cov enforces the full line coverage floor on CI; the agent, transport, persistence, and encryption paths are driven there by unit twins and integration extensions (`src/agent.rs`, `src/transport.rs`, `src/persistence.rs`, `src/encryption.rs`, `tests/`).
+- **Community and security scaffold** (`CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `.github/`): issue and PR templates, FUNDING, dependabot config, and a CodeQL workflow.
+
+### Changed
+
+- **Crate version is 3.2.0** (`Cargo.toml` / `Cargo.lock`), matching the release tag.
+- **Crypto and utility stack current** (`Cargo.toml`): aes-gcm 0.11, hmac 0.13, sha2 0.11, rand 0.10, base64 0.23, redis 1.7.1, thiserror 2.0.21, with the AEAD, digest, and rand API migrations applied (`src/encryption.rs`, `src/signing.rs`).
+- **CI actions current** (`.github/workflows/`): actions/checkout v7, actions-rust-lang/setup-rust-toolchain v2, taiki-e/install-action 2.87.21.
+
+### Fixed
+
+- **Fail-secure response-body read on every platform** (`src/transport.rs`): a failed body read is always a retryable transport failure, never classified from an empty string; a 201 with an unreadable body no longer counts as Accepted and a 429 no longer surfaces as a clean RateLimited.
+- **Lockfile escapes the yanked yoke-derive 0.8.3** (`Cargo.lock`): the msrv-aware resolver now picks the 0.8.4 republish, keeping the cargo-deny yanked check fully armed.
+
 ## [3.1.0] - 2026-09-27
 
 Parity release: the 3.0.2 to 3.1.0 agent feature train, in the same window as the Python and TypeScript agents.
@@ -44,5 +64,7 @@ Parity release: the 3.0.2 to 3.1.0 agent feature train, in the same window as th
 - Install identifier resolution (override, `~/.guard-agent/install-id`, or generated UUID) and sensitive metadata/tag redaction.
 - Wiremock-based integration tests mirroring the verified ingestion API contract, plus real-Redis integration tests (ignored by default; run with `--include-ignored`).
 
+[3.2.0]: https://github.com/rennf93/guard-agent-rs/releases/tag/v3.2.0
+[3.1.0]: https://github.com/rennf93/guard-agent-rs/releases/tag/v3.1.0
 [3.0.2]: https://github.com/rennf93/guard-agent-rs/releases/tag/v3.0.2
 [0.1.0]: https://github.com/rennf93/guard-agent-rs/releases/tag/v0.1.0

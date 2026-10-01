@@ -705,7 +705,7 @@ mod tests {
         assert!(rules.auto_ban_threshold.is_none() && rules.auto_ban_duration.is_none());
         assert!(rules.enable_rate_limit_auto_ban.is_none());
         assert!(!rules.emergency_mode && !rules.emergency_whitelist_only);
-        assert!(rules.emergency_whitelist.is_empty());
+        assert_eq!(rules.emergency_whitelist, Vec::<String>::new());
         assert!(rules.message.is_none() && rules.expires_at.is_none());
     }
 
