@@ -4,9 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.2.1] - 2026-10-07
+v3.2.1 (2026-10-07)
+-------------------
 
-The family lockstep artifact: the 3.2.1 wave tag. An empty lockstep release for the Guard agent family 3.2.1 wave: no shipped change, the crate has a zero `src/` diff since 3.2.0 apart from the version. The tag exists so the family stays version-aligned while the TypeScript port ships the wave's only runtime fix (the js/polynomial-redos endpoint normalization hardening, guard-agent-ts 3.2.1).
+The family lockstep artifact: the 3.2.1 wave tag (v3.2.1)
+---------------------------------------------------------
+
+An empty lockstep release for the Guard agent family 3.2.1 wave: no shipped change, the crate has a zero `src/` diff since 3.2.0 apart from the version. The tag exists so the family stays version-aligned while the TypeScript port ships the wave's only runtime fix (the js/polynomial-redos endpoint normalization hardening, guard-agent-ts 3.2.1).
 
 ### Changed
 
