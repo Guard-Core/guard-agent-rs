@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] - 2026-10-07
+
+The family lockstep artifact: the 3.2.1 wave tag. An empty lockstep release for the Guard agent family 3.2.1 wave: no shipped change, the crate has a zero `src/` diff since 3.2.0 apart from the version. The tag exists so the family stays version-aligned while the TypeScript port ships the wave's only runtime fix (the js/polynomial-redos endpoint normalization hardening, guard-agent-ts 3.2.1).
+
+### Changed
+
+- **Crate version is 3.2.1** (`Cargo.toml` / `Cargo.lock`), matching the release tag. No dependency, feature, or behavior delta since 3.2.0.
+
+### Compatibility
+
+- **Drop-in.** Consumers on 3.2.0 can move to 3.2.1 with no code or config changes.
+
 ## [3.2.0] - 2026-10-01
 
 Hardening and coverage release: the fail-secure response-body read restored on every platform, a 100% line coverage gate on CI, and the crypto and utility stack brought current.
@@ -64,6 +76,7 @@ Parity release: the 3.0.2 to 3.1.0 agent feature train, in the same window as th
 - Install identifier resolution (override, `~/.guard-agent/install-id`, or generated UUID) and sensitive metadata/tag redaction.
 - Wiremock-based integration tests mirroring the verified ingestion API contract, plus real-Redis integration tests (ignored by default; run with `--include-ignored`).
 
+[3.2.1]: https://github.com/rennf93/guard-agent-rs/releases/tag/v3.2.1
 [3.2.0]: https://github.com/rennf93/guard-agent-rs/releases/tag/v3.2.0
 [3.1.0]: https://github.com/rennf93/guard-agent-rs/releases/tag/v3.1.0
 [3.0.2]: https://github.com/rennf93/guard-agent-rs/releases/tag/v3.0.2
