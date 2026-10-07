@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "guard-agent-rs"
-version = "3.2.0"
+version = "3.2.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
