@@ -55,6 +55,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -97,6 +108,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -123,6 +145,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -147,6 +180,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -180,6 +224,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
