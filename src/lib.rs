@@ -66,6 +66,7 @@ pub mod config;
 pub mod encryption;
 pub mod error;
 pub mod install_id;
+pub mod logging_utils;
 pub mod models;
 pub mod persistence;
 pub mod rate_limiter;
