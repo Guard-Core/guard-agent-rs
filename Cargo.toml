@@ -10,10 +10,10 @@ categories    = ["web-programming"]
 description   = "Telemetry and monitoring agent for the Guard ecosystem (Rust)."
 documentation = "https://docs.rs/guard-agent-rs"
 edition       = "2024"
-homepage      = "https://github.com/rennf93/guard-agent-rs"
+homepage      = "https://github.com/Guard-Core/guard-agent-rs"
 keywords      = ["security", "telemetry", "monitoring", "api", "waf"]
 license       = "MIT OR Apache-2.0"
-repository    = "https://github.com/rennf93/guard-agent-rs"
+repository    = "https://github.com/Guard-Core/guard-agent-rs"
 rust-version  = "1.92"
 readme        = "README.md"
 

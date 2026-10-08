@@ -1,8 +1,8 @@
 # guard-agent-rs
 
-Telemetry and monitoring agent for the [Guard ecosystem](https://github.com/rennf93) (Rust). Companion agent to [guard-core-rs](https://github.com/rennf93/guard-core-rs) and its thin adapters, mirroring the semantics of [guard-agent](https://github.com/rennf93/guard-agent) (Python) and [guardagent](https://github.com/rennf93/guard-agent-ts) (TypeScript).
+Telemetry and monitoring agent for the [Guard ecosystem](https://github.com/Guard-Core) (Rust). Companion agent to [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) and its thin adapters, mirroring the semantics of [guard-agent](https://github.com/Guard-Core/guard-agent) (Python) and [guardagent](https://github.com/Guard-Core/guard-agent-ts) (TypeScript).
 
-Docs: <https://rennf93.github.io/guard-agent-rs/>
+Docs: <https://guard-core.github.io/guard-agent-rs/>
 
 The agent buffers security events, metrics, and status reports in memory, ships them to the Guard ingestion API, and applies an at-least-once reliability contract: nothing acknowledged is lost, nothing unacknowledged is forgotten.
 
@@ -114,10 +114,10 @@ All fields live on `AgentConfig` and have defaults; see the rustdoc for the full
 
 ## Links
 
-- Repository: <https://github.com/rennf93/guard-agent-rs>
-- Guard Core (Rust): <https://github.com/rennf93/guard-core-rs>
-- Guard Agent (Python): <https://github.com/rennf93/guard-agent>
-- Guard Agent (TypeScript): <https://github.com/rennf93/guard-agent-ts>
+- Repository: <https://github.com/Guard-Core/guard-agent-rs>
+- Guard Core (Rust): <https://github.com/Guard-Core/guard-core-rs>
+- Guard Agent (Python): <https://github.com/Guard-Core/guard-agent>
+- Guard Agent (TypeScript): <https://github.com/Guard-Core/guard-agent-ts>
 
 ## License
 

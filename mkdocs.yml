@@ -1,8 +1,8 @@
 site_name: guard-agent-rs
 site_description: Rust telemetry agent reporting to the Guard Core App ingestion API
 site_author: Renn F
-repo_url: https://github.com/rennf93/guard-agent-rs
-repo_name: rennf93/guard-agent-rs
+repo_url: https://github.com/Guard-Core/guard-agent-rs
+repo_name: Guard-Core/guard-agent-rs
 
 theme:
   name: material

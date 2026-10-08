@@ -58,7 +58,7 @@ Custom store without the `persistence` feature: implement `RedisHandler` and cal
 
 ## Related Projects
 
-- guard-core-rs (Rust engine): <https://github.com/rennf93/guard-core-rs>
-- guard-agent (Python, reference semantics): <https://github.com/rennf93/guard-agent>
-- guard-agent-ts (TypeScript sibling): <https://github.com/rennf93/guard-agent-ts>
-- guard-core-app (hosts the ingestion API): <https://github.com/rennf93/guard-core-app>
+- guard-core-rs (Rust engine): <https://github.com/Guard-Core/guard-core-rs>
+- guard-agent (Python, reference semantics): <https://github.com/Guard-Core/guard-agent>
+- guard-agent-ts (TypeScript sibling): <https://github.com/Guard-Core/guard-agent-ts>
+- guard-core-app (hosts the ingestion API): <https://github.com/Guard-Core/guard-core-app>
