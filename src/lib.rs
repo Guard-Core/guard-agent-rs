@@ -53,7 +53,7 @@
 //! `persistence` feature documentation for Redis-backed buffering.
 //!
 //! [`guard-agent`]: https://pypi.org/project/guard-agent/
-//! [`guardagent`]: https://github.com/rennf93/guard-agent-ts
+//! [`guardagent`]: https://github.com/Guard-Core/guard-agent-ts
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

@@ -128,8 +128,8 @@ pip install mkdocs-material && mkdocs build --strict  # documentation site (docs
 
 ## Related Projects
 
-- guard-core-rs: Rust security engine, <https://github.com/rennf93/guard-core-rs>
-- guard-agent (Python): reference agent semantics, <https://github.com/rennf93/guard-agent>
-- guard-agent-ts (TypeScript): sibling agent, <https://github.com/rennf93/guard-agent-ts>
-- guard-core-app: SaaS platform hosting the ingestion API, <https://github.com/rennf93/guard-core-app>
-- guard-core (Python engine): <https://github.com/rennf93/guard-core>
+- guard-core-rs: Rust security engine, <https://github.com/Guard-Core/guard-core-rs>
+- guard-agent (Python): reference agent semantics, <https://github.com/Guard-Core/guard-agent>
+- guard-agent-ts (TypeScript): sibling agent, <https://github.com/Guard-Core/guard-agent-ts>
+- guard-core-app: SaaS platform hosting the ingestion API, <https://github.com/Guard-Core/guard-core-app>
+- guard-core (Python engine): <https://github.com/Guard-Core/guard-core>
