@@ -58,6 +58,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod agent;
+#[cfg(feature = "guard-core")]
+#[cfg_attr(docsrs, doc(cfg(feature = "guard-core")))]
+pub mod bridge;
 pub mod circuit_breaker;
 pub mod config;
 pub mod encryption;
@@ -71,6 +74,9 @@ pub mod transport;
 pub mod utils;
 
 pub use agent::{AgentStats, GuardAgent, LoopFailures};
+#[cfg(feature = "guard-core")]
+#[cfg_attr(docsrs, doc(cfg(feature = "guard-core")))]
+pub use bridge::GuardAgentTelemetry;
 pub use circuit_breaker::CircuitBreakerState;
 pub use config::{
     AgentConfig, BufferOverflowPolicy, DEFAULT_BACKOFF_FACTOR, DEFAULT_BUFFER_SIZE,

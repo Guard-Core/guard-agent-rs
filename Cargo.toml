@@ -23,6 +23,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default     = []
+# The guard-core-rs engine seam: `GuardAgentTelemetry` implements the
+# facade's `TelemetryHandler` sink trait so the composite fan-out can hand
+# the agent every middleware-emitted event and metric.
+guard-core  = ["dep:guard-core-rs"]
 # Built-in Redis client for buffer persistence. The `RedisHandler` trait and an
 # in-memory implementation are always available, so callers may bring their own
 # client without enabling this feature.
@@ -35,6 +39,7 @@ base64    = "0.23"
 rand      = "0.10"
 chrono      = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 flate2      = "1"
+guard-core-rs = { version = "4.3.1", path = "../guard-core-rs/crates/guard-core-rs", optional = true, default-features = false }
 hmac        = "0.13"
 log         = "0.4"
 redis       = { version = "1", default-features = false, features = ["tokio-comp"], optional = true }
