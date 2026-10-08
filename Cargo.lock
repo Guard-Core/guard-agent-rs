@@ -807,6 +807,7 @@ dependencies = [
  "percent-encoding",
  "rand",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
  "unicode-normalization",

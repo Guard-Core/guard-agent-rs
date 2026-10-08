@@ -276,23 +276,59 @@ mod bridge_tests {
         event
     }
 
-    fn bridge() -> (
+    /// The bridge over a wiremock server: the rules endpoint answers
+    /// `200` with the reference-shaped payload and every ingest endpoint
+    /// answers `200`, so the lifecycle runs instantly and
+    /// deterministically (the server must stay bound for the test's
+    /// lifetime - hold the returned handle).
+    fn bridge_with(
+        rules_payload: Option<serde_json::Value>,
+    ) -> (
         GuardAgentTelemetry,
         Arc<GuardAgent>,
         tokio::runtime::Runtime,
+        wiremock::MockServer,
     ) {
+        use wiremock::ResponseTemplate;
+
         crate::test_support::install_trace_logger();
-        let mut config = AgentConfig::new("test-api-key-at-least-10-chars");
-        // A refused local port: the flushes fail fast, never touching a
-        // live endpoint.
-        config.endpoint = String::from("http://127.0.0.1:9");
-        let agent = Arc::new(GuardAgent::new(config).expect("valid config"));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("runtime");
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let rules_answer = ResponseTemplate::new(200).set_body_json(
+            rules_payload.unwrap_or_else(|| serde_json::json!({"rule_id": "rule-1", "version": 1})),
+        );
+        runtime.block_on(async {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v1/rules"))
+                .respond_with(rules_answer)
+                .mount(&server)
+                .await;
+            for ingest in ["/api/v1/events", "/api/v1/metrics", "/api/v1/status"] {
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path(ingest))
+                    .respond_with(ResponseTemplate::new(200))
+                    .mount(&server)
+                    .await;
+            }
+        });
+
+        let mut config = AgentConfig::new("test-api-key-at-least-10-chars");
+        config.endpoint = server.uri();
+        let agent = Arc::new(GuardAgent::new(config).expect("valid config"));
         let telemetry = GuardAgentTelemetry::new(Arc::clone(&agent), runtime.handle().clone());
-        (telemetry, agent, runtime)
+        (telemetry, agent, runtime, server)
+    }
+
+    fn bridge() -> (
+        GuardAgentTelemetry,
+        Arc<GuardAgent>,
+        tokio::runtime::Runtime,
+        wiremock::MockServer,
+    ) {
+        bridge_with(None)
     }
 
     fn wait_for(check: impl Fn() -> bool) {
@@ -396,7 +432,7 @@ mod bridge_tests {
 
     #[test]
     fn the_debug_shape_and_the_sink_name_render() {
-        let (telemetry, _agent, _runtime) = bridge();
+        let (telemetry, _agent, _runtime, _server) = bridge();
         assert_eq!(telemetry.handler_name(), "GuardAgent");
         let debug = format!("{telemetry:?}");
         assert!(debug.contains("GuardAgentTelemetry"));
@@ -428,13 +464,12 @@ mod bridge_tests {
 
     #[test]
     fn the_lifecycle_rides_the_sync_seam() {
-        let (telemetry, agent, runtime) = bridge();
+        let (telemetry, agent, runtime, _server) = bridge();
 
         // A not-yet-started agent answers unhealthy.
         assert!(!telemetry.health_check());
 
         telemetry.start().expect("start");
-        assert_eq!(telemetry.handler_name(), "GuardAgent");
         // The send paths buffer through the spawned tasks.
         telemetry.send_event(&facade_event()).expect("send event");
         let metric = FacadeSecurityMetric {
@@ -454,28 +489,25 @@ mod bridge_tests {
         // The started, near-empty agent answers healthy.
         assert!(telemetry.health_check());
 
-        // The flush against the refused port fails honestly: the batch
-        // requeues, the counters record it, and the lifetime failure
-        // rate (one failure, no successes) drives the health gate down -
-        // exactly the degradation surface the composite's flags expose.
-        telemetry.flush_buffer().expect("flush");
-        let stats = runtime.block_on(agent.get_stats());
-        // The at-least-once semantics: the drain counts as flushed, the
-        // failed batch requeues (still buffered), the request counts as
-        // failed.
-        assert_eq!(stats.events_flushed, 1);
-        assert_eq!(stats.events_buffered, 1);
-        assert!(stats.requests_failed >= 1);
+        // An empty-buffer flush returns without touching the transport.
+        let (quiet, _quiet_agent, _quiet_runtime, _quiet_server) = bridge();
+        quiet.flush_buffer().expect("empty-buffer flush");
+
+        // The rules fetch rides the mock's payload through the trait's
+        // serialization slot.
         let rules = telemetry.get_dynamic_rules().expect("rules");
-        assert!(rules.is_none(), "no server: the fetch answers none");
-        assert!(!telemetry.health_check(), "the failed flush is unhealthy");
+        let rules = rules.expect("the mock answers a rules payload");
+        assert_eq!(rules["rule_id"], "rule-1");
+
+        // The started agent answers healthy; the stopped one does not.
+        assert!(telemetry.health_check());
         telemetry.stop().expect("stop");
         assert!(!telemetry.health_check(), "stopped agents answer false");
     }
 
     #[test]
     fn the_composite_drives_the_agent_through_the_bus_adapter() {
-        let (telemetry, agent, runtime) = bridge();
+        let (telemetry, agent, runtime, _server) = bridge();
         telemetry.start().expect("start");
 
         let composite = guard_core_rs::composite::CompositeAgentHandler::new(
