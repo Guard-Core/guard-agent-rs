@@ -33,6 +33,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
+
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.x

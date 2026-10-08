@@ -20,6 +20,12 @@ An empty lockstep release for the Guard agent family 3.2.1 wave: no shipped chan
 
 - **Drop-in.** Consumers on 3.2.0 can move to 3.2.1 with no code or config changes.
 
+## [Unreleased]
+
+### Added
+
+- **The guard-core-rs engine seam** (`bridge`, behind the `guard-core` feature): `GuardAgentTelemetry` implements the facade's `guard_core_rs::composite::TelemetryHandler` sink trait, so the engine's `CompositeAgentHandler` fan-out hands the agent every middleware-emitted event and metric - the Rust counterpart of the reference `agent_handler=GuardAgentHandler(...)` handoff. The event map is name for name against `_utils/agent_events.py` (event_type, ip_address, country, user_agent, endpoint, method, decorator_type, rule_type, handler_name, action_taken, reason, response_time transfer directly; `status_code` and `pattern_matched` surface from the facade's free-form metadata bag exactly as the reference's per-site kwargs populate them; a fresh idempotency key stamps on construction; the metadata bag forwards as the wire object for the agent's ingest-time redaction); the metric map parses the seven `METRIC_*` wire names and rejects unknown types as sink errors. Threading contract: the facade's trait is synchronous (the engine's I/O-free seam idiom), so the send paths spawn onto the wired runtime (fire-and-forget from any thread, buffering cannot fail) while the lifecycle paths block on it (call off the async request path); `initialize_redis` rides the trait default since the agent attaches its own persistence through `attach_redis_handler` (the reference `initialize_agent`/`initialize_redis` pairing). Nine tests drive the map, the full sync lifecycle against a real runtime (start, buffered sends through the spawned tasks, the at-least-once flush failure surface, the dynamic-rules carrier, health degradation, stop), and the composite bus adapter end to end.
+
 ## [3.2.0] - 2026-10-01
 
 Hardening and coverage release: the fail-secure response-body read restored on every platform, a 100% line coverage gate on CI, and the crypto and utility stack brought current.

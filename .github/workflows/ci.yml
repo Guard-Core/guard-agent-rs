@@ -55,6 +55,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -97,6 +108,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -108,8 +130,23 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Enforce 100% line coverage
-        run: cargo llvm-cov --all-features --fail-under-lines 100 -- --include-ignored
+      # The gate computes line coverage from the lcov export's per-line DA
+      # records, not from llvm-cov's summary: the summary aggregation
+      # falsely claims misses its own lcov view refutes (the artifact
+      # root-caused and documented in guard-core-rs's coverage gate; the
+      # same toolchain pair trips it here once the bridge feature's data
+      # joins the profile). Fail-closed 100%-lines semantics; the summary
+      # stays as an informational printout.
+      - name: Generate the line-coverage export
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -- --include-ignored
+
+      - name: Enforce 100% line coverage from the export's per-line records
+        run: python3 .github/scripts/enforce_line_coverage.py lcov.info
+
+      # `report` takes no feature flags: it reads the profdata the run
+      # above already produced.
+      - name: Print the informational llvm-cov summary
+        run: cargo llvm-cov report
 
   msrv:
     name: MSRV (1.92)
@@ -122,6 +159,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -147,6 +195,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -180,6 +239,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Checkout guard-core-rs (path dependency)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rennf93/guard-core-rs
+          ref: master
+          path: core-checkout
+          persist-credentials: false
+
+      - name: Place guard-core-rs at the path dependency location
+        run: mv core-checkout ../guard-core-rs
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
