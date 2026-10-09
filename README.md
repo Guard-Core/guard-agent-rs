@@ -1,10 +1,62 @@
-# guard-agent-rs
+<p align="center">
+    <a href="https://guard-core.github.io/guard-core/latest/">
+        <img src="https://guard-core.github.io/guard-core/latest/assets/guard_core_legend.svg" alt="Guard Core">
+    </a>
+</p>
 
-Telemetry and monitoring agent for the [Guard ecosystem](https://github.com/Guard-Core) (Rust). Companion agent to [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) and its thin adapters, mirroring the semantics of [guard-agent](https://github.com/Guard-Core/guard-agent) (Python) and [guardagent](https://github.com/Guard-Core/guard-agent-ts) (TypeScript).
+___
 
-Docs: <https://guard-core.github.io/guard-agent-rs/>
+<p align="center">
+    <strong>Telemetry and monitoring agent for the [Guard ecosystem](https://github.com/Guard-Core) (Rust). Companion agent to [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) and its thin adapters, mirroring the semantics of [guard-agent](https://github.com/Guard-Core/guard-agent) (Python) and [guardagent](https://github.com/Guard-Core/guard-agent-ts) (TypeScript).</strong>
+</p>
 
-The agent buffers security events, metrics, and status reports in memory, ships them to the Guard ingestion API, and applies an at-least-once reliability contract: nothing acknowledged is lost, nothing unacknowledged is forgotten.
+<p align="center">
+    <a href="https://crates.io/crates/guard-agent-rs">
+        <img src="https://img.shields.io/crates/v/guard-agent-rs?color=0080ff" alt="Crates.io version">
+    </a>
+    <a href="https://guard-core.github.io/guard-agent-rs/latest/">
+        <img src="https://img.shields.io/badge/docs-latest-0080ff.svg" alt="Docs">
+    </a>
+    <a href="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/release.yml">
+        <img src="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/release.yml/badge.svg" alt="Release">
+    </a>
+    <a href="https://opensource.org/licenses/MIT">
+        <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+    </a>
+    <a href="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/ci.yml">
+        <img src="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/ci.yml/badge.svg" alt="CI">
+    </a>
+    <a href="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/code-ql.yml">
+        <img src="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/code-ql.yml/badge.svg" alt="CodeQL">
+    </a>
+</p>
+
+<p align="center">
+    <a href="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/pages/pages-build-deployment">
+        <img src="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/pages/pages-build-deployment/badge.svg?branch=gh-pages" alt="PagesBuildDeployment">
+    </a>
+    <a href="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/docs.yml">
+        <img src="https://github.com/Guard-Core/guard-agent-rs/actions/workflows/docs.yml/badge.svg" alt="DocsUpdate">
+    </a>
+    <img src="https://img.shields.io/github/last-commit/Guard-Core/guard-agent-rs?style=flat&amp;logo=git&amp;logoColor=white&amp;color=0080ff" alt="last-commit">
+</p>
+
+<p align="center">
+    <img src="https://img.shields.io/badge/Rust-DEA584.svg?style=flat&logo=rust&logoColor=white" alt="Rust"> <img src="https://img.shields.io/badge/Redis-FF4438.svg?style=flat&logo=redis&logoColor=white" alt="Redis">
+    <a href="https://crates.io/crates/guard-agent-rs">
+        <img src="https://img.shields.io/crates/d/guard-agent-rs" alt="Downloads">
+    </a>
+</p>
+
+<p align="center">
+    <a href="https://guard-core.com">Website</a> &middot;
+    <a href="https://guard-core.github.io/guard-agent-rs/latest/">Docs</a> &middot;
+    <a href="https://playground.guard-core.com">Playground</a> &middot;
+    <a href="https://app.guard-core.com">Dashboard</a> &middot;
+    <a href="https://discord.gg/ZW7ZJbjMkK">Discord</a>
+</p>
+
+---
 
 ## Status
 
