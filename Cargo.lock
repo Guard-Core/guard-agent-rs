@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "guard-agent-rs"
-version = "3.2.1"
+version = "3.2.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-engine"
-version = "4.3.1"
+version = "4.3.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-rs"
-version = "4.3.1"
+version = "4.3.2"
 dependencies = [
  "chrono",
  "guard-core-engine",

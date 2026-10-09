@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+v3.2.2 (2026-10-09)
+-------------------
+
+The engine-seam release: the guard-core-rs telemetry bridge and the reference log-record formatters land, lockstep with guard-agent 3.2.2 on PyPI (v3.2.2)
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+### Note
+
+- Lockstep with the family: PyPI's `guard-agent` 3.2.2 is live and this crate tags the same wave (the crate's first content release since 3.2.0)
+
+### Added
+
+- **The guard-core-rs engine seam** (`bridge`, behind the `guard-core` feature): `GuardAgentTelemetry` implements the facade's `guard_core_rs::composite::TelemetryHandler` sink trait, so the engine's `CompositeAgentHandler` fan-out hands the agent every middleware-emitted event and metric - the Rust counterpart of the reference `agent_handler=GuardAgentHandler(...)` handoff. The event map is name for name against `_utils/agent_events.py` (event_type, ip_address, country, user_agent, endpoint, method, decorator_type, rule_type, handler_name, action_taken, reason, response_time transfer directly; `status_code` and `pattern_matched` surface from the facade's free-form metadata bag exactly as the reference's per-site kwargs populate them; a fresh idempotency key stamps on construction; the metadata bag forwards as the wire object for the agent's ingest-time redaction); the metric map parses the seven `METRIC_*` wire names and rejects unknown types as sink errors. Threading contract: the facade's trait is synchronous (the engine's I/O-free seam idiom), so the send paths spawn onto the wired runtime (fire-and-forget from any thread, buffering cannot fail) while the lifecycle paths block on it (call off the async request path); `initialize_redis` rides the trait default since the agent attaches its own persistence through `attach_redis_handler` (the reference `initialize_agent`/`initialize_redis` pairing). Nine tests drive the map, the full sync lifecycle against a real runtime (start, buffered sends through the spawned tasks, the at-least-once flush failure surface, the dynamic-rules carrier, health degradation, stop), and the composite bus adapter end to end.
+- **The reference log-record formatters** (`logging_utils`, the GAP-R12 logging half): `json_record` (the `JsonFormatter` four-field shape in reference key order), `text_record` (the `[%(name)s] %(asctime)s - %(levelname)s - %(message)s` layout), and `asctime` (the python-logging `formatTime` stamp, UTC) - the portable record-rendering half of `logging_utils.py`; the reference's `setup_agent_logging` registry wiring stays documented as N.A.-idiom (the `log` facade has no registry for this crate to own, the host subscriber formats through its own machinery)
+
+### Changed
+
+- **Crate version is 3.2.2** (`Cargo.toml` / `Cargo.lock`), matching the release tag and the PyPI `guard-agent` 3.2.2 wave.
+
+### Compatibility
+
+- **Drop-in.** Consumers on 3.2.1 can move to 3.2.2 with no code or config changes; both new surfaces are additive at the crate root (the bridge behind the `guard-core` feature).
+
 v3.2.1 (2026-10-07)
 -------------------
 
@@ -21,10 +44,6 @@ An empty lockstep release for the Guard agent family 3.2.1 wave: no shipped chan
 - **Drop-in.** Consumers on 3.2.0 can move to 3.2.1 with no code or config changes.
 
 ## [Unreleased]
-
-### Added
-
-- **The guard-core-rs engine seam** (`bridge`, behind the `guard-core` feature): `GuardAgentTelemetry` implements the facade's `guard_core_rs::composite::TelemetryHandler` sink trait, so the engine's `CompositeAgentHandler` fan-out hands the agent every middleware-emitted event and metric - the Rust counterpart of the reference `agent_handler=GuardAgentHandler(...)` handoff. The event map is name for name against `_utils/agent_events.py` (event_type, ip_address, country, user_agent, endpoint, method, decorator_type, rule_type, handler_name, action_taken, reason, response_time transfer directly; `status_code` and `pattern_matched` surface from the facade's free-form metadata bag exactly as the reference's per-site kwargs populate them; a fresh idempotency key stamps on construction; the metadata bag forwards as the wire object for the agent's ingest-time redaction); the metric map parses the seven `METRIC_*` wire names and rejects unknown types as sink errors. Threading contract: the facade's trait is synchronous (the engine's I/O-free seam idiom), so the send paths spawn onto the wired runtime (fire-and-forget from any thread, buffering cannot fail) while the lifecycle paths block on it (call off the async request path); `initialize_redis` rides the trait default since the agent attaches its own persistence through `attach_redis_handler` (the reference `initialize_agent`/`initialize_redis` pairing). Nine tests drive the map, the full sync lifecycle against a real runtime (start, buffered sends through the spawned tasks, the at-least-once flush failure surface, the dynamic-rules carrier, health degradation, stop), and the composite bus adapter end to end.
 
 ## [3.2.0] - 2026-10-01
 
