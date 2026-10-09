@@ -1,0 +1,39 @@
+[workspace]
+# Standalone demo crate: kept out of the parent workspace so the CI
+# coverage/clippy gates measure the agent crate only.
+
+[package]
+name          = "guard-agent-demo-app"
+version       = "0.1.0"
+authors       = ["Renzo Franceschini <rennf93@users.noreply.github.com>"]
+categories    = ["web-programming"]
+description   = "Containerized guard-agent-rs demo: a small HTTP service streaming security telemetry to a Guard Core ingestion endpoint."
+documentation = "https://docs.rs/guard-agent-rs"
+edition       = "2024"
+homepage      = "https://github.com/Guard-Core/guard-agent-rs"
+keywords      = ["security", "telemetry", "monitoring", "api", "waf"]
+license       = "MIT OR Apache-2.0"
+repository    = "https://github.com/Guard-Core/guard-agent-rs"
+rust-version  = "1.92"
+publish       = false
+
+[dependencies]
+guard-agent-rs = { path = "../.." }
+log            = "0.4"
+env_logger     = "0.11"
+tokio          = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all                      = { level = "deny", priority = -1 }
+cast_possible_truncation = "allow"
+cast_precision_loss      = "allow"
+significant_drop_tightening = "allow"
+duration_suboptimal_units   = "allow"
+missing_errors_doc       = "allow"
+missing_panics_doc       = "allow"
+module_name_repetitions  = "allow"
+nursery                  = { level = "warn", priority = -1 }
+pedantic                 = { level = "warn", priority = -1 }
