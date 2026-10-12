@@ -278,6 +278,10 @@ impl GuardAgent {
     pub fn new(config: AgentConfig) -> Result<Self, GuardAgentError> {
         let mut config = config;
         config.validate()?;
+        #[cfg(feature = "guard-core")]
+        if config.guard_core_version.is_none() {
+            config.guard_core_version = Some(guard_core_rs::VERSION.to_owned());
+        }
         let config = Arc::new(config);
 
         let install_id = resolve_install_id(config.install_id.as_deref());
@@ -1388,6 +1392,25 @@ mod tests {
         config.dynamic_rule_interval = 3_600;
         config.buffer_size = 10;
         GuardAgent::new(config).expect("valid config")
+    }
+
+    #[cfg(feature = "guard-core")]
+    #[tokio::test]
+    async fn guard_core_version_defaults_to_the_linked_core_and_yields_to_a_set_value() {
+        let agent = agent_for_test();
+        assert_eq!(
+            agent.shared.config.guard_core_version.as_deref(),
+            Some(guard_core_rs::VERSION)
+        );
+
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = "http://127.0.0.1:9".to_owned();
+        config.guard_core_version = Some("0.0.1".to_owned());
+        let pinned = GuardAgent::new(config).expect("valid config");
+        assert_eq!(
+            pinned.shared.config.guard_core_version.as_deref(),
+            Some("0.0.1")
+        );
     }
 
     #[tokio::test]
