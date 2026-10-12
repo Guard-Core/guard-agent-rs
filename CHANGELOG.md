@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+v3.2.3 (2026-10-12)
+-------------------
+
+Core version reporting, lockstep with the agent family at 3.2.3 (v3.2.3)
+-----------------------------------------------------------------------
+
+### Note
+
+- The crate version moves to 3.2.3 so all five agents ship the same version.
+
+### Changed
+
+- With the `guard-core` feature enabled, `GuardAgent::new` fills `guard_core_version` from `guard_core_rs::VERSION` when it is unset, so the Guard SaaS sees which core is running; a value set by the caller wins. The optional `guard-core-rs` requirement moves to 4.3.3.
+
 v3.2.2 (2026-10-09)
 -------------------
 

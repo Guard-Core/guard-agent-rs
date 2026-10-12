@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name          = "guard-agent-rs"
-version       = "3.2.2"
+version       = "3.2.3"
 authors       = ["Renzo Franceschini <rennf93@users.noreply.github.com>"]
 categories    = ["web-programming"]
 description   = "Telemetry and monitoring agent for the Guard ecosystem (Rust)."
@@ -39,7 +39,7 @@ base64    = "0.23"
 rand      = "0.10"
 chrono      = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 flate2      = "1"
-guard-core-rs = { version = "4.3.1", path = "../guard-core-rs/crates/guard-core-rs", optional = true, default-features = false }
+guard-core-rs = { version = "4.3.3", path = "../guard-core-rs/crates/guard-core-rs", optional = true, default-features = false }
 hmac        = "0.13"
 log         = "0.4"
 redis       = { version = "1", default-features = false, features = ["tokio-comp"], optional = true }
