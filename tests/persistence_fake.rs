@@ -54,6 +54,7 @@ async fn enqueue_persists_and_failed_flush_retains_the_keys() {
 
     agent.send_event(event(1)).await;
     agent.send_event(event(2)).await;
+    agent.wait_for_persists().await;
 
     assert_eq!(store.len(), 2, "both events persisted on enqueue");
     assert!(!agent.get_stats().await.durability_degraded);
@@ -76,6 +77,7 @@ async fn reload_on_startup_and_confirm_on_success() {
         .attach_redis_handler(Arc::clone(&store) as Arc<_>)
         .await;
     failing.send_event(event(1)).await;
+    failing.wait_for_persists().await;
     failing.flush_buffer().await;
     assert_eq!(store.len(), 1);
 
@@ -117,6 +119,7 @@ async fn drop_policy_confirms_the_evicted_record() {
 
     agent.send_event(event(1)).await;
     agent.send_event(event(2)).await;
+    agent.wait_for_persists().await;
 
     let stats = agent.get_stats().await;
     assert_eq!(stats.events_buffered, 1, "capacity 1");
@@ -136,6 +139,7 @@ async fn clear_buffer_wipes_memory_and_durable_records() {
     agent
         .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
         .await;
+    agent.wait_for_persists().await;
     assert_eq!(store.len(), 2);
 
     agent.clear_buffer().await;

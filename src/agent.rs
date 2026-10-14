@@ -200,6 +200,7 @@ struct Shared {
     core: tokio::sync::Mutex<CoreState>,
     flush_permits: Arc<Semaphore>,
     inflight: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    persists: std::sync::Mutex<Vec<JoinHandle<()>>>,
     shutdown: Arc<Notify>,
     started_at: Instant,
     running: AtomicBool,
@@ -299,6 +300,7 @@ impl GuardAgent {
                 core: tokio::sync::Mutex::new(CoreState::new(capacity)),
                 flush_permits: Arc::new(Semaphore::new(permits)),
                 inflight: std::sync::Mutex::new(Vec::new()),
+                persists: std::sync::Mutex::new(Vec::new()),
                 shutdown: Arc::new(Notify::new()),
                 started_at: Instant::now(),
                 running: AtomicBool::new(false),
@@ -387,7 +389,30 @@ impl GuardAgent {
         }
 
         self.await_inflight().await;
+        // Settle pending Redis writes before the final flush so their keys
+        // are tracked (and confirmed) rather than raced. Bounded: each write
+        // is already capped by the Redis command timeout.
+        let _ = tokio::time::timeout(LOOP_SHUTDOWN_GRACE, self.wait_for_persists()).await;
         self.flush_buffer().await;
+    }
+
+    /// Waits for every Redis write started by `send_event` / `send_metric`.
+    ///
+    /// Ingest returns without waiting on Redis (the write runs as a
+    /// background task), so callers that need the record durable, such as
+    /// tests or a shutdown path, await this. [`stop`](Self::stop) does it.
+    pub async fn wait_for_persists(&self) {
+        let pending: Vec<JoinHandle<()>> = {
+            let mut persists = self
+                .shared
+                .persists
+                .lock()
+                .expect("persists mutex not poisoned");
+            std::mem::take(&mut *persists)
+        };
+        for handle in pending {
+            let _ = handle.await;
+        }
     }
 
     /// Waits (bounded) for in-flight watermark-triggered flushes.
@@ -465,13 +490,16 @@ impl GuardAgent {
             let mut core = self.shared.core.lock().await;
             if core.events.len() < capacity {
                 let event = event.take().expect("event present while buffering");
-                let redis_key = persist_item(&mut core, NAMESPACE_EVENTS, "event", &event).await;
+                let pending = prepare_persist(&mut core, "event", &event);
                 core.events.push_back(BufferedItem {
                     item: event,
-                    redis_key,
+                    redis_key: pending.as_ref().map(|pending| pending.key.clone()),
                 });
                 let trigger = core.events.len() as f64 >= watermark;
                 drop(core);
+                if let Some(pending) = pending {
+                    spawn_persist(&self.shared, Kind::Events, pending);
+                }
                 if trigger {
                     spawn_gated_flush(&self.shared);
                 }
@@ -522,13 +550,16 @@ impl GuardAgent {
             let mut core = self.shared.core.lock().await;
             if core.metrics.len() < capacity {
                 let metric = metric.take().expect("metric present while buffering");
-                let redis_key = persist_item(&mut core, NAMESPACE_METRICS, "metric", &metric).await;
+                let pending = prepare_persist(&mut core, "metric", &metric);
                 core.metrics.push_back(BufferedItem {
                     item: metric,
-                    redis_key,
+                    redis_key: pending.as_ref().map(|pending| pending.key.clone()),
                 });
                 let trigger = core.metrics.len() as f64 >= watermark;
                 drop(core);
+                if let Some(pending) = pending {
+                    spawn_persist(&self.shared, Kind::Metrics, pending);
+                }
                 if trigger {
                     spawn_gated_flush(&self.shared);
                 }
@@ -824,18 +855,41 @@ fn compute_status(shared: &Shared, core: &CoreState) -> AgentStatus {
     }
 }
 
-/// Persists an item, returning the short key on success.
+/// Which buffer a persisted record belongs to.
+#[derive(Clone, Copy)]
+enum Kind {
+    Events,
+    Metrics,
+}
+
+impl Kind {
+    const fn namespace(self) -> &'static str {
+        match self {
+            Self::Events => NAMESPACE_EVENTS,
+            Self::Metrics => NAMESPACE_METRICS,
+        }
+    }
+}
+
+/// A serialized record ready to be written to Redis off the core lock.
+struct PendingPersist {
+    key: String,
+    value: String,
+    handler: Arc<dyn RedisHandler>,
+}
+
+/// Mints the key and serializes the item under the lock (CPU only); the
+/// Redis write itself happens in [`spawn_persist`] without the lock.
 ///
-/// Persistence failures are counted, logged, and otherwise swallowed: the
-/// item still lands in the in-memory buffer (fail-open).
-async fn persist_item<T: Serialize + Sync>(
+/// Returns `None` without a handler, or when serialization fails (counted,
+/// logged and otherwise swallowed: the item still lands in the in-memory
+/// buffer, fail-open).
+fn prepare_persist<T: Serialize + Sync>(
     core: &mut CoreState,
-    namespace: &str,
     prefix: &str,
     item: &T,
-) -> Option<String> {
-    let handler = core.redis_handler.as_ref()?;
-    let short_key = generate_short_key(prefix);
+) -> Option<PendingPersist> {
+    let handler = core.redis_handler.clone()?;
     let value = {
         // `serde_json` serialization of the typed `SecurityEvent` and
         // `SecurityMetric` payloads is total: every field is a string,
@@ -857,15 +911,67 @@ async fn persist_item<T: Serialize + Sync>(
         #[cfg(coverage)]
         serde_json::to_string(item).expect("typed model serialization is total")
     };
-    match handler
-        .set_key(namespace, &short_key, &value, PERSIST_TTL_SECONDS)
-        .await
-    {
-        Ok(()) => Some(short_key),
+    Some(PendingPersist {
+        key: generate_short_key(prefix),
+        value,
+        handler,
+    })
+}
+
+/// The slot holding `key` while its item is still buffered.
+fn key_slot<'a>(core: &'a mut CoreState, kind: Kind, key: &str) -> Option<&'a mut Option<String>> {
+    match kind {
+        Kind::Events => core
+            .events
+            .iter_mut()
+            .map(|buffered| &mut buffered.redis_key)
+            .find(|slot| slot.as_deref() == Some(key)),
+        Kind::Metrics => core
+            .metrics
+            .iter_mut()
+            .map(|buffered| &mut buffered.redis_key)
+            .find(|slot| slot.as_deref() == Some(key)),
+    }
+}
+
+/// Runs the Redis write as a tracked background task so ingest never waits
+/// on Redis and the core lock is never held across it.
+fn spawn_persist(shared: &Arc<Shared>, kind: Kind, pending: PendingPersist) {
+    let task_shared = Arc::clone(shared);
+    let handle = tokio::spawn(async move { run_persist(&task_shared, kind, pending).await });
+    track(&shared.persists, handle);
+}
+
+/// Writes the record, then settles its key against the buffer. The item was
+/// buffered with the key before the write started, so a flush or eviction
+/// that ran meanwhile already forgot the key before it existed in Redis:
+/// delete it now instead of orphaning it. A failed write clears the key.
+async fn run_persist(shared: &Shared, kind: Kind, pending: PendingPersist) {
+    let PendingPersist {
+        key,
+        value,
+        handler,
+    } = pending;
+    let namespace = kind.namespace();
+    let written = handler
+        .set_key(namespace, &key, &value, PERSIST_TTL_SECONDS)
+        .await;
+    let mut core = shared.core.lock().await;
+    let slot = key_slot(&mut core, kind, &key);
+    match written {
+        Ok(()) if slot.is_some() => {}
+        Ok(()) => {
+            drop(core);
+            if let Err(error) = handler.delete_keys(namespace, &[key]).await {
+                log::warn!("Failed to delete persisted record from Redis: {error}");
+            }
+        }
         Err(error) => {
             core.redis_persist_failures += 1;
-            log::warn!("Failed to persist {prefix} to Redis: {error}");
-            None
+            log::warn!("Failed to persist {namespace} record to Redis: {error}");
+            if let Some(slot) = key_slot(&mut core, kind, &key) {
+                *slot = None;
+            }
         }
     }
 }
@@ -908,7 +1014,7 @@ async fn confirm_keys(shared: &Shared, namespace: &str, keys: Vec<Option<String>
         core.redis_handler.clone()
     };
     // Live keys imply a persistence handler (they are minted by
-    // `persist_item`); the memory-only guard is compiled out of the coverage
+    // `prepare_persist`); the memory-only guard is compiled out of the coverage
     // build as provably unreachable (see PR notes).
     #[cfg(not(coverage))]
     let Some(handler) = handler else {
@@ -1187,13 +1293,13 @@ fn spawn_gated_flush(shared: &Arc<Shared>) {
             flush_if_needed(&task_shared, permit).await;
         }
     });
-    track_inflight(shared, handle);
+    track(&shared.inflight, handle);
 }
 
-fn track_inflight(shared: &Shared, handle: JoinHandle<()>) {
-    let mut inflight = shared.inflight.lock().expect("inflight mutex not poisoned");
-    inflight.retain(|handle| !handle.is_finished());
-    inflight.push(handle);
+fn track(list: &std::sync::Mutex<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
+    let mut list = list.lock().expect("task list mutex not poisoned");
+    list.retain(|handle| !handle.is_finished());
+    list.push(handle);
 }
 
 /// Background flush loop: every `flush_interval` seconds, run a gated flush.
@@ -2261,6 +2367,7 @@ mod tests {
             .attach_redis_handler(Arc::new(FakeStore::fail_set()) as Arc<dyn RedisHandler>)
             .await;
         agent.send_event(SecurityEvent::new("x")).await;
+        agent.wait_for_persists().await;
         let stats = agent.get_stats().await;
         assert_eq!(stats.redis_persist_failures, 1);
         assert_eq!(stats.events_buffered, 1, "fail-open buffering");
@@ -2531,11 +2638,11 @@ mod tests {
     }
 
     // The serialization-failure arm is compiled out of the coverage build
-    // (typed-model serialization is total; see `persist_item`), so this
+    // (typed-model serialization is total; see `prepare_persist`), so this
     // generic-`T` test only exists in normal builds.
     #[cfg(not(coverage))]
     #[tokio::test]
-    async fn persist_item_counts_serialization_failures() {
+    async fn prepare_persist_counts_serialization_failures() {
         use serde::Serialize;
 
         struct Unserializable;
@@ -2551,8 +2658,8 @@ mod tests {
             .attach_redis_handler(Arc::new(InMemoryRedisStore::new()) as Arc<dyn RedisHandler>)
             .await;
         let mut core = agent.shared.core.lock().await;
-        let outcome = persist_item(&mut core, NAMESPACE_EVENTS, "event", &Unserializable).await;
-        assert_eq!(outcome, None);
+        let outcome = prepare_persist(&mut core, "event", &Unserializable);
+        assert!(outcome.is_none());
         assert_eq!(core.redis_persist_failures, 1);
     }
 
@@ -2574,5 +2681,325 @@ mod tests {
             !store.keys(NAMESPACE_EVENTS).contains(&"evt_1".to_owned()),
             "the live key was deleted"
         );
+    }
+
+    /// A store whose writes block on a gate, so ordering is deterministic.
+    struct GatedStore {
+        inner: InMemoryRedisStore,
+        gate: Semaphore,
+        entered: Notify,
+        started: std::sync::atomic::AtomicUsize,
+        fail_delete: AtomicBool,
+    }
+
+    impl GatedStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemoryRedisStore::new(),
+                gate: Semaphore::new(0),
+                entered: Notify::new(),
+                started: std::sync::atomic::AtomicUsize::new(0),
+                fail_delete: AtomicBool::new(false),
+            })
+        }
+
+        async fn until_started(&self, count: usize) {
+            while self.started.load(Ordering::SeqCst) < count {
+                self.entered.notified().await;
+            }
+        }
+
+        fn release(&self, writes: usize) {
+            self.gate.add_permits(writes);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RedisHandler for GatedStore {
+        async fn set_key(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: &str,
+            ttl_seconds: u64,
+        ) -> Result<(), GuardAgentError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_waiters();
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            self.inner.set_key(namespace, key, value, ttl_seconds).await
+        }
+
+        async fn get_key(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<Option<String>, GuardAgentError> {
+            self.inner.get_key(namespace, key).await
+        }
+
+        async fn delete_keys(
+            &self,
+            namespace: &str,
+            keys: &[String],
+        ) -> Result<(), GuardAgentError> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(GuardAgentError::Transport("delete failed".to_owned()));
+            }
+            self.inner.delete_keys(namespace, keys).await
+        }
+
+        async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, GuardAgentError> {
+            self.inner.list_keys(namespace).await
+        }
+
+        async fn clear_namespace(&self, namespace: &str) -> Result<(), GuardAgentError> {
+            self.inner.clear_namespace(namespace).await
+        }
+    }
+
+    async fn agent_with_gated_store() -> (GuardAgent, Arc<GatedStore>) {
+        let store = GatedStore::new();
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::clone(&store) as Arc<dyn RedisHandler>)
+            .await;
+        (agent, store)
+    }
+
+    fn pending_persists(agent: &GuardAgent) -> usize {
+        agent.shared.persists.lock().expect("lock").len()
+    }
+
+    #[tokio::test]
+    async fn send_returns_before_a_slow_redis_write_completes() {
+        let (agent, store) = agent_with_gated_store().await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+        store.until_started(2).await;
+        assert!(store.inner.is_empty(), "the writes are still gated");
+        let stats = agent.get_stats().await;
+        assert_eq!((stats.events_buffered, stats.metrics_buffered), (1, 1));
+
+        store.release(2);
+        agent.wait_for_persists().await;
+        assert_eq!(store.inner.len(), 2);
+        let core = agent.shared.core.lock().await;
+        assert!(core.events[0].redis_key.is_some());
+        assert!(core.metrics[0].redis_key.is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_are_not_serialized_behind_a_slow_write() {
+        let (agent, store) = agent_with_gated_store().await;
+        let agent = Arc::new(agent);
+        let senders: Vec<_> = (0..8)
+            .map(|index| {
+                let agent = Arc::clone(&agent);
+                tokio::spawn(async move {
+                    agent
+                        .send_event(SecurityEvent::new(format!("e{index}")))
+                        .await;
+                })
+            })
+            .collect();
+        for sender in senders {
+            sender.await.expect("sender task");
+        }
+        store.until_started(8).await;
+        assert!(store.inner.is_empty(), "every write is still gated");
+        assert_eq!(agent.get_stats().await.events_buffered, 8);
+        let _ = agent.get_status().await; // takes the same lock, must not hang
+
+        store.release(8);
+        agent.wait_for_persists().await;
+        assert_eq!(store.inner.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn stop_drains_pending_persists() {
+        let (agent, store) = agent_with_gated_store().await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        store.until_started(1).await;
+
+        let agent = Arc::new(agent);
+        let stopper = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move { agent.stop().await })
+        };
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!stopper.is_finished(), "stop waits for the pending write");
+
+        store.release(1);
+        stopper.await.expect("stop task");
+        assert_eq!(pending_persists(&agent), 0);
+        assert_eq!(
+            store.inner.len(),
+            1,
+            "the write landed before stop returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_during_persist_deletes_the_key_instead_of_tracking_it() {
+        let (agent, store) = agent_with_gated_store().await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+        store.until_started(2).await;
+
+        // Drain and confirm the way an accepted flush does, before the keys
+        // exist in Redis.
+        let ((_, event_keys), (_, metric_keys)) = {
+            let mut core = agent.shared.core.lock().await;
+            let CoreState {
+                events,
+                metrics,
+                events_flushed,
+                metrics_flushed,
+                ..
+            } = &mut *core;
+            (
+                drain(events, events_flushed),
+                drain(metrics, metrics_flushed),
+            )
+        };
+        confirm_keys(&agent.shared, NAMESPACE_EVENTS, event_keys).await;
+        confirm_keys(&agent.shared, NAMESPACE_METRICS, metric_keys).await;
+
+        store.release(2);
+        agent.wait_for_persists().await;
+        assert!(
+            store.inner.is_empty(),
+            "late keys were deleted, not orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_store_delegates_reads_and_maintenance_to_the_inner_store() {
+        let store = GatedStore::new();
+        store.release(1);
+        store
+            .set_key(NAMESPACE_EVENTS, "k", "v", 60)
+            .await
+            .expect("set");
+        assert_eq!(
+            store.get_key(NAMESPACE_EVENTS, "k").await.expect("get"),
+            Some("v".to_owned())
+        );
+        assert_eq!(
+            store.list_keys(NAMESPACE_EVENTS).await.expect("list"),
+            vec!["k".to_owned()]
+        );
+        store
+            .clear_namespace(NAMESPACE_EVENTS)
+            .await
+            .expect("clear");
+        assert!(store.inner.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_late_delete_is_swallowed() {
+        let (agent, store) = agent_with_gated_store().await;
+        store.fail_delete.store(true, Ordering::SeqCst);
+        agent.send_event(SecurityEvent::new("x")).await;
+        store.until_started(1).await;
+        agent.shared.core.lock().await.events.clear();
+        store.release(1);
+        agent.wait_for_persists().await;
+        assert_eq!(store.inner.len(), 1, "the orphan is left to expire by TTL");
+    }
+
+    #[tokio::test]
+    async fn eviction_during_persist_deletes_the_key() {
+        let (agent, store) = agent_with_gated_store().await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        store.until_started(1).await;
+        let evicted = {
+            let mut core = agent.shared.core.lock().await;
+            core.events.pop_front().expect("buffered").redis_key
+        };
+        {
+            let core = agent.shared.core.lock().await;
+            forget_key(&core, NAMESPACE_EVENTS, evicted).await;
+        }
+        store.release(1);
+        agent.wait_for_persists().await;
+        assert!(store.inner.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requeue_during_persist_tracks_the_key() {
+        let (agent, store) = agent_with_gated_store().await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        store.until_started(1).await;
+
+        {
+            let mut core = agent.shared.core.lock().await;
+            let CoreState {
+                events,
+                events_flushed,
+                events_dropped,
+                ..
+            } = &mut *core;
+            let (items, keys) = drain(events, events_flushed);
+            let evicted = requeue(events, 10, items, keys, events_dropped);
+            assert_eq!(evicted.len(), 0);
+        }
+        store.release(1);
+        agent.wait_for_persists().await;
+        assert_eq!(store.inner.len(), 1, "the record stays for retry");
+        let core = agent.shared.core.lock().await;
+        let key = core.events[0].redis_key.clone().expect("key tracked");
+        assert!(store.inner.peek(NAMESPACE_EVENTS, &key).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_clears_the_key_and_a_late_failure_is_ignored() {
+        let agent = agent_for_test();
+        agent
+            .attach_redis_handler(Arc::new(FakeStore::fail_set()) as Arc<dyn RedisHandler>)
+            .await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent.wait_for_persists().await;
+        let core = agent.shared.core.lock().await;
+        assert!(core.events[0].redis_key.is_none());
+        assert_eq!(core.redis_persist_failures, 1);
+        drop(core);
+
+        // Flushed before the failing write resolved: nothing left to clear.
+        let slot_count = {
+            let mut core = agent.shared.core.lock().await;
+            core.events.clear();
+            key_slot(&mut core, Kind::Events, "gone").is_some()
+        };
+        assert!(!slot_count);
+        let pending = {
+            let mut core = agent.shared.core.lock().await;
+            prepare_persist(&mut core, "event", &SecurityEvent::new("y")).expect("handler")
+        };
+        run_persist(&agent.shared, Kind::Events, pending).await;
+        assert_eq!(agent.get_stats().await.redis_persist_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn no_task_is_spawned_without_a_redis_handler() {
+        let agent = agent_for_test();
+        agent.send_event(SecurityEvent::new("x")).await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+        assert_eq!(pending_persists(&agent), 0);
+        let core = agent.shared.core.lock().await;
+        assert!(core.events[0].redis_key.is_none());
+        assert!(core.metrics[0].redis_key.is_none());
     }
 }

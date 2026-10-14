@@ -125,6 +125,7 @@ async fn persists_events_with_ttl_and_confirms_on_success() {
     for index in 0..3 {
         agent.send_event(event(index)).await;
     }
+    agent.wait_for_persists().await;
 
     let mut conn = raw_connection().await;
     let pattern = format!("{prefix}:agent_events:*");
@@ -169,6 +170,7 @@ async fn retains_records_across_a_restart() {
     for index in 0..2 {
         failing.send_event(event(index)).await;
     }
+    failing.wait_for_persists().await;
     failing.flush_buffer().await;
 
     let mut conn = raw_connection().await;
