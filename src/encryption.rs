@@ -120,7 +120,8 @@ impl std::fmt::Debug for PayloadEncryptor {
 }
 
 impl PayloadEncryptor {
-    /// Decodes a padded (or unpadded) urlsafe-base64 256-bit key.
+    /// Decodes a padded (or unpadded) urlsafe-base64 256-bit key; surrounding
+    /// whitespace is stripped first, like Python (`encryption.py:72`).
     ///
     /// # Errors
     ///
@@ -134,7 +135,7 @@ impl PayloadEncryptor {
             ));
         }
         let decoded = URL_SAFE_NO_PAD
-            .decode(project_key.trim_end_matches('='))
+            .decode(project_key.trim().trim_end_matches('='))
             .map_err(|error| {
                 GuardAgentError::Encryption(format!("Invalid project key format: {error}"))
             })?;

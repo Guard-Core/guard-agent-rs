@@ -169,3 +169,12 @@ async fn fails_startup_without_plaintext_fallback_on_invalid_key() {
     config.project_encryption_key = Some("not-a-valid-key".to_owned());
     assert!(GuardAgent::new(config).is_err());
 }
+
+#[test]
+fn accepts_a_key_with_surrounding_whitespace_like_python() {
+    // Python strips the key (`encryption.py:72`) before padding and decoding.
+    let key = vectors()[0]["key_b64"].as_str().unwrap().to_owned();
+    assert!(PayloadEncryptor::new(&format!("  {key}\n")).is_ok());
+    assert!(PayloadEncryptor::new(&format!("\t{}\t", key.trim_end_matches('='))).is_ok());
+    assert!(PayloadEncryptor::new("   ").is_err());
+}

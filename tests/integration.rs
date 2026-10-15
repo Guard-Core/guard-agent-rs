@@ -104,7 +104,7 @@ async fn failed_flushes_requeue_then_recover_for_both_kinds() {
 }
 
 #[tokio::test]
-async fn permanent_rejections_confirm_batches_without_counting_sends() {
+async fn permanent_rejections_confirm_batches_and_count_as_sent() {
     let mock = MockApi::start(Behavior::AlwaysFail {
         status: 400,
         body: "bad request",
@@ -121,8 +121,8 @@ async fn permanent_rejections_confirm_batches_without_counting_sends() {
     let stats = agent.get_stats().await;
     assert_eq!(stats.events_buffered, 0, "the 400 batch was confirmed");
     assert_eq!(stats.metrics_buffered, 0, "the 400 batch was confirmed");
-    assert_eq!(stats.events_sent, 0, "a drop is not a send");
-    assert_eq!(stats.metrics_sent, 0);
+    assert_eq!(stats.events_sent, 1, "reference: a drop counts as sent");
+    assert_eq!(stats.metrics_sent, 1);
 }
 
 #[tokio::test]
@@ -158,6 +158,7 @@ async fn background_loops_push_status_and_count_rule_failures() {
     .await;
     let mut config = config_for(&mock);
     config.status_interval = 60;
+    config.project_id = Some("proj-rules".to_owned());
     config.dynamic_rule_interval = 60;
     // A request still in flight during a pump must not hit its deadline.
     config.timeout = 600;
@@ -455,7 +456,7 @@ async fn permanent_rejection_drops_the_batch_without_retrying() {
     let stats = agent.get_stats().await;
     assert_eq!(stats.events_buffered, 0, "intentionally dropped");
     assert_eq!(stats.events_failed, 0, "drop is not a failed send");
-    assert_eq!(stats.events_sent, 0);
+    assert_eq!(stats.events_sent, 1, "reference: sent += len on a drop");
 
     // Nothing left to send.
     agent.flush_buffer().await;
