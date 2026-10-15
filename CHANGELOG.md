@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+v3.2.4 (2026-10-15)
+-------------------
+
+Redis persistence off the core lock (v3.2.4)
+--------------------------------------------
+
+### Fixed
+
+- The Redis persist no longer runs under the core lock: writes are tracked background tasks that `stop` drains, so a slow or failing Redis no longer delays event-emitting requests. In-flight writes are capped at `buffer_size` (shared by events and metrics): past the cap the record stays in memory only, counts toward `redis_persist_failures`, and one warning is logged per degradation episode. A write whose record left the buffer before the task started is skipped, and membership is tracked in a key map instead of scanning the buffer. Lockstep release with the agent family at 3.2.4.
+
 v3.2.3 (2026-10-12)
 -------------------
 
