@@ -61,7 +61,8 @@ pub trait RedisHandler: Send + Sync + 'static {
     /// Deletes the given records. Missing keys are ignored.
     async fn delete_keys(&self, namespace: &str, keys: &[String]) -> Result<(), GuardAgentError>;
 
-    /// Lists the short keys currently stored in `namespace`.
+    /// Lists the short keys currently stored in `namespace`, in the order the
+    /// store returns them (unsorted, like the Python reference).
     async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, GuardAgentError>;
 
     /// Deletes every record in `namespace`.
@@ -191,12 +192,10 @@ impl RedisHandler for InMemoryRedisStore {
         let prefix = format!("{namespace}:");
         let mut entries = self.entries.lock().expect("store mutex not poisoned");
         entries.retain(|_, entry| !entry.is_expired(now));
-        let mut keys: Vec<String> = entries
+        Ok(entries
             .keys()
             .filter_map(|key| key.strip_prefix(&prefix).map(str::to_owned))
-            .collect();
-        keys.sort();
-        Ok(keys)
+            .collect())
     }
 
     async fn clear_namespace(&self, namespace: &str) -> Result<(), GuardAgentError> {
@@ -299,12 +298,10 @@ impl RedisHandler for RedisClientHandler {
         let mut cmd = redis::cmd("KEYS");
         cmd.arg(format!("{prefix}*"));
         let full_keys: Vec<String> = self.query(&cmd).await?;
-        let mut short_keys: Vec<String> = full_keys
+        Ok(full_keys
             .iter()
             .filter_map(|key| key.strip_prefix(&prefix).map(str::to_owned))
-            .collect();
-        short_keys.sort();
-        Ok(short_keys)
+            .collect())
     }
 
     async fn clear_namespace(&self, namespace: &str) -> Result<(), GuardAgentError> {
