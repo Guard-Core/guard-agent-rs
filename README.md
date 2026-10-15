@@ -146,7 +146,7 @@ ___
 
 ## Status
 
-Released. Version 3.2.3, published to crates.io.
+Released. Version 3.2.4, published to crates.io.
 
 ## Features
 
