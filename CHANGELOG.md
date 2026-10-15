@@ -7,12 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 v3.2.4 (2026-10-15)
 -------------------
 
-Redis persistence off the core lock (v3.2.4)
---------------------------------------------
+Redis persistence off the core lock, Python agent parity in redaction, transport and flush, lockstep with the agent family at 3.2.4 (v3.2.4)
+--------------------------------------------------------------------------------------------------------------------------------------------
 
 ### Fixed
 
 - The Redis persist no longer runs under the core lock: writes are tracked background tasks that `stop` drains, so a slow or failing Redis no longer delays event-emitting requests. In-flight writes are capped at `buffer_size` (shared by events and metrics): past the cap the record stays in memory only, counts toward `redis_persist_failures`, and one warning is logged per degradation episode. A write whose record left the buffer before the task started is skipped, and membership is tracked in a key map instead of scanning the buffer. Lockstep release with the agent family at 3.2.4.
+- Redaction, transport and flush semantics match the Python agent (#57, #58). Values nested past the depth bound are redacted wholesale, JSON-looking string values are parsed and sanitized (and wholesale redacted past 8192 characters), metric tag values get the same nested handling, and the transport runs a second header sanitization pass like `_redact_sensitive_headers`. An encrypted batch answered with 413 is split and each half re-encrypted instead of dropped whole, and the right half of a split is still sent when the left half fails. A permanent rejection (400, 404, 422) counts as sent and resets the flush streak and the retry gate. The rules loop starts only when a project id is set, an encryption key with surrounding whitespace is stripped, and `loop_failures.flush` resets every loop iteration. POST accepts only 200 and 201, GET follows the same rules, redirects are not followed, and any other status, an unparseable 200 or a 200 with an empty object is retried at once without opening the breaker
+- Persisted records are reloaded in the order the store returns them, like the Python agent, instead of sorted by key (#60)
+
+### Changed
+
+- With the `guard-core` feature enabled, the optional `guard-core-rs` requirement moves to 4.4.0 so the agent ships in lockstep with the engines. `serde_json` enables `preserve_order` so redacted payloads keep their key order. Publish guard-core-rs 4.4.0 first
 
 v3.2.3 (2026-10-12)
 -------------------
