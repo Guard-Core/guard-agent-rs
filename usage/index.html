@@ -659,9 +659,11 @@ triggers an early flush.</p>
 <li>A 413 (the ingestion API rejects batches above 262144 bytes decompressed)
   splits the batch in half recursively or drops its oldest item rather than
   retrying a permanently oversized payload</li>
-<li>400, 404, and 422 are permanent: the batch is dropped and confirmed, not
-  retried</li>
-<li>401, 403, other 4xx, 5xx, and network errors are retryable</li>
+<li>400, 404, and 422 are permanent: the batch is dropped and confirmed (and
+  counted as sent), not retried</li>
+<li>401, 403, 5xx, and network errors are retryable with backoff; any other
+  status (202, 204, 3xx, 405, 408) is retried at once without opening the
+  circuit breaker</li>
 <li>A 200 with <code>success: false</code> (or a non-empty <code>errors</code> list) requeues the
   failed items in the original order</li>
 <li>The circuit breaker opens after 5 consecutive transport failures and
@@ -701,7 +703,7 @@ last good rules cached, mirroring the Python agent. Outgoing rules polls share
 the batch-send retry machinery: the local rate limiter pre-check, the circuit
 breaker, capped <code>Retry-After</code> handling on 429, and exponential backoff.</p>
 <p><code>start</code> also spawns a background rules loop on <code>dynamic_rule_interval</code>
-(default 300s, minimum 60s). <code>get_stats()</code> reports the rules surface:
+(default 300s, minimum 60s) when a <code>project_id</code> is configured. <code>get_stats()</code> reports the rules surface:
 <code>rules_fetched</code> (lifetime refreshes), <code>cached_rules</code> (whether a document is
 cached), <code>rules_last_update</code> (Unix seconds of the last refresh), and
 <code>loop_failures.rules</code> (consecutive failed polls).</p>
