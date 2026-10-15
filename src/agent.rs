@@ -195,7 +195,8 @@ pub struct AgentStats {
 struct LoopHandles {
     flush: JoinHandle<()>,
     status: JoinHandle<()>,
-    rules: JoinHandle<()>,
+    /// Absent without a project id (`client.py:128-129`).
+    rules: Option<JoinHandle<()>>,
 }
 
 /// State shared between the public handle and the background loops.
@@ -362,7 +363,13 @@ impl GuardAgent {
         *loops = Some(LoopHandles {
             flush: tokio::spawn(flush_loop(Arc::clone(&self.shared))),
             status: tokio::spawn(status_loop(Arc::clone(&self.shared))),
-            rules: tokio::spawn(rules_loop(Arc::clone(&self.shared))),
+            rules: self
+                .shared
+                .config
+                .project_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(|_| tokio::spawn(rules_loop(Arc::clone(&self.shared)))),
         });
     }
 
@@ -387,12 +394,16 @@ impl GuardAgent {
             let _ = tokio::time::timeout(LOOP_SHUTDOWN_GRACE, async {
                 let _ = (&mut flush).await;
                 let _ = (&mut status).await;
-                let _ = (&mut rules).await;
+                if let Some(rules) = rules.as_mut() {
+                    let _ = rules.await;
+                }
             })
             .await;
             flush.abort();
             status.abort();
-            rules.abort();
+            if let Some(rules) = &rules {
+                rules.abort();
+            }
         }
 
         self.await_inflight().await;
@@ -1148,7 +1159,10 @@ async fn flush_events(shared: &Shared) {
         .send_batch(BatchItems::Events(items.clone()))
         .await;
     match outcome {
-        SendOutcome::Accepted => {
+        // A dropped permanent rejection is a success for the flush state: the
+        // reference returns True, so sent += len, the streak resets and the
+        // retry gate clears (`_client_flush.py:67-78`).
+        SendOutcome::Accepted | SendOutcome::PermanentDrop { .. } => {
             confirm_keys(shared, NAMESPACE_EVENTS, keys).await;
             let mut core = shared.core.lock().await;
             core.events_sent += count as u64;
@@ -1160,9 +1174,6 @@ async fn flush_events(shared: &Shared) {
             }
             core.events_failure_streak = 0;
             core.events_retry_after = None;
-        }
-        SendOutcome::PermanentDrop { .. } => {
-            confirm_keys(shared, NAMESPACE_EVENTS, keys).await;
         }
         SendOutcome::Failed { error } => {
             let evicted = {
@@ -1190,7 +1201,6 @@ async fn flush_events(shared: &Shared) {
                     PARTIAL_FAILURE_MAX_BACKOFF_SECS,
                 );
                 core.events_retry_after = Some(Instant::now() + Duration::from_secs_f64(delay));
-                core.loop_failures.flush += 1;
                 delay
             };
             if !evicted.is_empty() {
@@ -1232,7 +1242,7 @@ async fn flush_metrics(shared: &Shared) {
         .send_batch(BatchItems::Metrics(items.clone()))
         .await;
     match outcome {
-        SendOutcome::Accepted => {
+        SendOutcome::Accepted | SendOutcome::PermanentDrop { .. } => {
             confirm_keys(shared, NAMESPACE_METRICS, keys).await;
             let mut core = shared.core.lock().await;
             core.metrics_sent += count as u64;
@@ -1244,9 +1254,6 @@ async fn flush_metrics(shared: &Shared) {
             }
             core.metrics_failure_streak = 0;
             core.metrics_retry_after = None;
-        }
-        SendOutcome::PermanentDrop { .. } => {
-            confirm_keys(shared, NAMESPACE_METRICS, keys).await;
         }
         SendOutcome::Failed { error } => {
             let evicted = {
@@ -1274,7 +1281,6 @@ async fn flush_metrics(shared: &Shared) {
                     PARTIAL_FAILURE_MAX_BACKOFF_SECS,
                 );
                 core.metrics_retry_after = Some(Instant::now() + Duration::from_secs_f64(delay));
-                core.loop_failures.flush += 1;
                 delay
             };
             if !evicted.is_empty() {
@@ -1361,17 +1367,23 @@ async fn flush_loop(shared: Arc<Shared>) {
             });
             // `flush_if_needed` never panics; the panic-accounting branch is
             // compiled out of the coverage build as provably unreachable
-            // (see PR notes).
+            // (see PR notes). Like the reference's `_flush_loop`, a completed
+            // iteration resets the counter (`flush_buffer` swallows send
+            // failures, so only a crashed iteration counts).
             #[cfg(not(coverage))]
-            if let Err(error) = handle.await
-                && error.is_panic()
-            {
-                let mut core = shared.core.lock().await;
-                core.loop_failures.flush += 1;
-                log::error!("Flush task panicked: {error}");
+            match handle.await {
+                Err(error) if error.is_panic() => {
+                    let mut core = shared.core.lock().await;
+                    core.loop_failures.flush += 1;
+                    log::error!("Flush task panicked: {error}");
+                }
+                _ => shared.core.lock().await.loop_failures.flush = 0,
             }
             #[cfg(coverage)]
-            let _ = handle.await;
+            {
+                let _ = handle.await;
+                shared.core.lock().await.loop_failures.flush = 0;
+            }
         }
     }
 }
@@ -1599,7 +1611,7 @@ mod tests {
             *loops = Some(LoopHandles {
                 flush: tokio::spawn(std::future::pending::<()>()),
                 status: tokio::spawn(std::future::pending::<()>()),
-                rules: parked,
+                rules: Some(parked),
             });
         }
         // The second start sees the stale handles and refuses to spawn a
@@ -3105,5 +3117,70 @@ mod tests {
         assert_eq!(store.started.load(Ordering::SeqCst), 0, "no Redis write");
         assert!(store.inner.is_empty());
         assert_eq!(agent.shared.core.lock().await.pending_persists.len(), 0);
+    }
+
+    async fn permanent_rejection_agent(
+        status: u16,
+        endpoint_path: &str,
+    ) -> (GuardAgent, wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(endpoint_path))
+            .respond_with(ResponseTemplate::new(status).set_body_string("rejected"))
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 5;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        (GuardAgent::new(config).unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_permanent_rejection_is_a_success_for_the_flush_state() {
+        let (agent, _events) = permanent_rejection_agent(400, "/api/v1/events").await;
+        agent.send_event(SecurityEvent::new("x")).await;
+        {
+            let mut core = agent.shared.core.lock().await;
+            core.events_failure_streak = 3;
+            core.events_retry_after = Some(Instant::now());
+        }
+        flush_events(&agent.shared).await;
+        let core = agent.shared.core.lock().await;
+        assert_eq!(core.events_sent, 1, "sent += len");
+        assert_eq!(core.events_failed, 0);
+        assert_eq!(core.events_failure_streak, 0, "streak reset");
+        assert!(core.events_retry_after.is_none(), "retry gate cleared");
+        drop(core);
+
+        let (agent, _metrics) = permanent_rejection_agent(422, "/api/v1/metrics").await;
+        agent
+            .send_metric(SecurityMetric::new(MetricType::RequestCount, 1.0))
+            .await;
+        {
+            let mut core = agent.shared.core.lock().await;
+            core.metrics_failure_streak = 3;
+            core.metrics_retry_after = Some(Instant::now());
+        }
+        flush_metrics(&agent.shared).await;
+        let core = agent.shared.core.lock().await;
+        assert_eq!(core.metrics_sent, 1);
+        assert_eq!(core.metrics_failure_streak, 0);
+        assert!(core.metrics_retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_permanently_rejected_status_push_is_a_failure() {
+        // Python `send_status` raises `PermanentClientError`, which its blanket
+        // `except` turns into False: the status loop counts a failure.
+        let (agent, _server) = permanent_rejection_agent(400, "/api/v1/status").await;
+        push_status_once(&agent.shared).await;
+        let core = agent.shared.core.lock().await;
+        assert_eq!(core.loop_failures.status, 1);
+        assert_eq!(core.last_status_push_ok, Some(false));
     }
 }

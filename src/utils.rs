@@ -1,6 +1,7 @@
 //! Shared helpers: backoff math, `Retry-After` parsing, payload redaction,
 //! batch identifiers, and gzip compression.
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,8 +11,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// Maximum depth walked when redacting nested structured data.
+/// Maximum depth walked when redacting nested structured data; a subtree
+/// deeper than this is redacted wholesale (`_MAX_SANITIZE_DEPTH`).
 pub const MAX_REDACT_DEPTH: usize = 10;
+
+/// Longest JSON-looking string that is parsed and sanitized; a longer one is
+/// redacted wholesale (`_MAX_JSON_SCAN_LEN`).
+pub const MAX_JSON_SCAN_LEN: usize = 8192;
+
+/// Stands in for the `NaN` and `Infinity` literals Python's `json` accepts
+/// and `serde_json` rejects, so a string carrying them is still parsed and
+/// sanitized instead of passing through unredacted.
+const NONFINITE_SENTINEL: &str = "\u{1}guard-agent-nonfinite:";
 
 /// Maximum response body length kept in error details.
 pub const MAX_DETAIL_CHARS: usize = 300;
@@ -110,7 +121,6 @@ pub fn hash_ip(ip: &str, salt: &str) -> String {
     let digest = Sha256::digest(format!("{ip}{salt}").as_bytes());
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
     hex.chars().take(HASH_IP_HEX_CHARS).collect()
@@ -163,42 +173,231 @@ impl Redactor {
         self.keys.contains(&normalized)
     }
 
-    /// Recursively redacts sensitive keys inside a JSON value.
+    /// Recursively redacts sensitive keys inside a JSON value, matching
+    /// `sanitize_headers` (`guard_agent/utils.py:62-197`).
     pub fn redact_value(&self, value: &mut Value) {
-        self.redact_inner(value, 0);
+        *value = self.sanitize(value, 0);
     }
 
-    fn redact_inner(&self, value: &mut Value, depth: usize) {
-        if depth >= MAX_REDACT_DEPTH {
-            return;
+    fn sanitize(&self, value: &Value, depth: usize) -> Value {
+        if depth > MAX_REDACT_DEPTH {
+            return Value::String(REDACTED_PLACEHOLDER.to_owned());
         }
         match value {
-            Value::Object(map) => {
-                for (key, entry) in map.iter_mut() {
-                    if self.is_sensitive(key) {
-                        *entry = Value::String(REDACTED_PLACEHOLDER.to_owned());
-                    } else {
-                        self.redact_inner(entry, depth + 1);
-                    }
-                }
-            }
-            Value::Array(items) => {
-                for entry in items.iter_mut() {
-                    self.redact_inner(entry, depth + 1);
-                }
-            }
-            _ => {}
+            Value::String(text) => Value::String(self.sanitize_string(text, depth)),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, entry)| {
+                        let entry = if self.is_sensitive(key) {
+                            Value::String(REDACTED_PLACEHOLDER.to_owned())
+                        } else {
+                            self.sanitize(entry, depth + 1)
+                        };
+                        (key.clone(), entry)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|entry| self.sanitize(entry, depth + 1))
+                    .collect(),
+            ),
+            other => other.clone(),
         }
     }
 
-    /// Redacts sensitive keys from a flat string map.
+    /// Parses a JSON-looking string, sanitizes inside it and re-dumps it the
+    /// way Python's `json.dumps` does; other strings pass through, and a
+    /// JSON-looking string over [`MAX_JSON_SCAN_LEN`] is redacted wholesale.
+    fn sanitize_string(&self, text: &str, depth: usize) -> String {
+        let stripped = text.trim();
+        if !stripped.starts_with(['{', '[', '"']) {
+            return text.to_owned();
+        }
+        if stripped.chars().count() > MAX_JSON_SCAN_LEN {
+            return REDACTED_PLACEHOLDER.to_owned();
+        }
+        match parse_json_like(stripped) {
+            Parsed::Value(parsed) => python_json_dumps(&self.sanitize(&parsed, depth + 1)),
+            Parsed::Invalid => text.to_owned(),
+            Parsed::Unsafe => REDACTED_PLACEHOLDER.to_owned(),
+        }
+    }
+
+    /// Redacts sensitive keys from a flat string map, and sanitizes
+    /// JSON-looking values (they sit one level below the mapping).
     pub fn redact_tags(&self, tags: &mut std::collections::BTreeMap<String, String>) {
         for (key, value) in tags.iter_mut() {
-            if self.is_sensitive(key) {
-                REDACTED_PLACEHOLDER.clone_into(value);
+            *value = if self.is_sensitive(key) {
+                REDACTED_PLACEHOLDER.to_owned()
+            } else {
+                self.sanitize_string(value, 1)
+            };
+        }
+    }
+}
+
+enum Parsed {
+    Value(Value),
+    /// Not JSON, so Python leaves the string as it is.
+    Invalid,
+    /// Python would parse it but `serde_json` cannot (a lone surrogate
+    /// escape, nesting past its recursion limit): redacted wholesale rather
+    /// than passed through with its secrets intact.
+    Unsafe,
+}
+
+fn parse_json_like(text: &str) -> Parsed {
+    let error = match serde_json::from_str::<Value>(text) {
+        Ok(parsed) => return Parsed::Value(parsed),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    // serde_json reports a lone surrogate escape as a "surrogate" or "hex
+    // escape" error; Python accepts both.
+    if ["surrogate", "hex escape", "recursion limit"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        return Parsed::Unsafe;
+    }
+    if text.contains("NaN") || text.contains("Infinity") {
+        let rewritten = replace_nonfinite_literals(text);
+        if let Ok(parsed) = serde_json::from_str::<Value>(&rewritten)
+            && !has_sentinel_key(&parsed)
+        {
+            return Parsed::Value(parsed);
+        }
+    }
+    Parsed::Invalid
+}
+
+/// A bare literal in key position (`{NaN: 1}`) is not JSON for Python either.
+fn has_sentinel_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, entry)| key.starts_with(NONFINITE_SENTINEL) || has_sentinel_key(entry)),
+        Value::Array(items) => items.iter().any(has_sentinel_key),
+        _ => false,
+    }
+}
+
+/// Replaces the bare `NaN`, `Infinity` and `-Infinity` tokens outside JSON
+/// strings with sentinel strings.
+fn replace_nonfinite_literals(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        let rest: String = chars[index..].iter().take(9).collect();
+        let token = ["NaN", "Infinity", "-Infinity"]
+            .into_iter()
+            .find(|token| rest.starts_with(token));
+        let boundary = |at: usize| chars.get(at).is_none_or(|c| !c.is_alphanumeric());
+        match token {
+            Some(token) if boundary(index + token.len()) => {
+                // The sentinel's leading control character needs its JSON escape.
+                let _ = write!(out, "\"\\u0001{}{token}\"", &NONFINITE_SENTINEL[1..]);
+                index += token.len();
+            }
+            _ => {
+                out.push(ch);
+                index += 1;
             }
         }
     }
+    out
+}
+
+/// `json.dumps(value)` with Python's defaults: `", "` and `": "` separators,
+/// insertion order, `ensure_ascii`, and Python's float spelling.
+fn python_json_dumps(value: &Value) -> String {
+    let mut out = String::new();
+    write_python_json(value, &mut out);
+    out
+}
+
+fn write_python_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => out.push_str(&python_number(number)),
+        Value::String(text) => {
+            if let Some(token) = text.strip_prefix(NONFINITE_SENTINEL) {
+                out.push_str(token);
+            } else {
+                out.push('"');
+                crate::encryption::escape_string(text, out);
+                out.push('"');
+            }
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_python_json(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push('"');
+                crate::encryption::escape_string(key, out);
+                out.push_str("\": ");
+                write_python_json(item, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Spells a number like Python's `repr`: `serde_json` prints `1e16` and
+/// `1e-7` where Python prints `1e+16` and `1e-07`.
+fn python_number(number: &serde_json::Number) -> String {
+    let mut text = number.to_string();
+    // Python's `repr` switches to the exponent form below 1e-4, serde_json's
+    // formatter only below 1e-5.
+    if let Some(small) = number
+        .as_f64()
+        .filter(|float| number.is_f64() && *float != 0.0 && float.abs() < 1e-4)
+        && !text.contains('e')
+    {
+        text = format!("{small:e}");
+    }
+    let Some((mantissa, exponent)) = text.split_once('e') else {
+        return text;
+    };
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let sign = if exponent < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exponent.abs())
 }
 
 /// Types whose sensitive fields are redacted before buffering.
@@ -355,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn redactor_stops_at_max_depth() {
+    fn redactor_redacts_everything_past_max_depth_wholesale() {
         let redactor = Redactor::new(&["cookie".to_owned()]);
         // Build a chain deeper than the walk limit.
         let mut value = json!({"cookie": "deep"});
@@ -364,10 +563,12 @@ mod tests {
         }
         redactor.redact_value(&mut value);
         let mut cursor = &value;
-        for _ in 0..(MAX_REDACT_DEPTH + 2) {
+        for _ in 0..MAX_REDACT_DEPTH {
             cursor = &cursor["level"];
         }
-        assert_eq!(cursor["cookie"], "deep");
+        // The mapping at depth MAX_REDACT_DEPTH is still walked; its child is
+        // at depth MAX_REDACT_DEPTH + 1 and is redacted whole.
+        assert_eq!(cursor["level"], REDACTED_PLACEHOLDER);
     }
 
     #[test]

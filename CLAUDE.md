@@ -6,7 +6,7 @@ Guidance for AI agents (including Claude Code) working in this repository.
 guard-agent-rs is the Rust telemetry agent for the Guard ecosystem. It buffers security events, metrics, and status reports in memory, flushes them to the Guard ingestion API with at-least-once semantics, and exposes an injectable persistence layer (Redis or custom) so unconfirmed telemetry survives process restarts. It is the Rust counterpart of the Python `guard-agent` and the TypeScript `guardagent` packages, and a standalone crate (it is not a member of the guard-core-rs workspace).
 
 - Package name: `guard-agent-rs` (import name `guard_agent_rs`)
-- Version: 0.1.0
+- Version: see `Cargo.toml` (kept in lockstep with the agent family)
 - Edition: 2024, MSRV 1.92
 - License: dual MIT OR Apache-2.0
 - License files: `LICENSE-MIT` and `LICENSE-APACHE` (there is no single `LICENSE` file)
@@ -52,7 +52,7 @@ Key invariants an agent must preserve when editing:
 
 - `send_event` / `send_metric` never fail. All errors funnel into logs, counters (`get_stats`), and the optional `on_error` hook.
 - The flush layer owns the at-least-once handshake: drain, send, then confirm (delete persisted keys) on `Accepted` or intentional `PermanentDrop`, or requeue at the front in original order on `Failed`.
-- 400, 404, and 422 are terminal drops; 401, 403, other 4xx, 5xx, and network errors are retryable; 429 consumes an attempt and sleeps the `Retry-After` value.
+- 400, 404, and 422 are terminal drops and count as sent (the reference returns True); 413 splits the batch (encrypted batches are re-encrypted per half); 401, 403, 5xx, and network errors are retryable with backoff; any other status (202, 204, 3xx, 405, 408) and an unparseable or empty-object 200 are a transient "no result" that is retried at once without opening the breaker; 429 consumes an attempt and sleeps the `Retry-After` value.
 - Overflow `drop` evicts the oldest item and deletes its persisted record; requeue pressure evicts the newest tail item the same way. No orphaned records.
 - Persistence is fail-open: a store error never blocks buffering or sending.
 - Community workflows (`issue-link`, `stale`, `sync-labels`) stay byte-identical to the agent family's (guard-agent-go and siblings); `greetings`, `summary`, and `labeler`/`labels` carry repo-specific text (agent subsystems, not engine or adapter internals) and must not drift in structure.
@@ -80,7 +80,7 @@ cargo build -p guard-agent-basic-usage
 
 ## Configuration
 
-`AgentConfig::new(api_key)` fills defaults; `GuardAgent::new` validates and normalizes (endpoint trailing slashes and legacy `/api/v1` suffix are stripped). Important fields: `endpoint`, `project_id`, `buffer_size` (100 per kind), `flush_interval` (30s), `status_interval` (300s, minimum 60), `dynamic_rule_interval` (300s, minimum 60; drives the background rules loop started by `start`), `high_watermark_ratio` (0.8), `buffer_overflow_policy` (`drop`/`block`/`raise`), `retry_attempts` (3), `backoff_factor` (1.0), `timeout` (30s), `compression_enabled` + `compression_threshold` (1024 bytes), `payload_signing_secret`, `install_id`, and with feature `persistence` a `redis: Option<RedisConfig>` (URL carries credentials and DB index; `key_prefix` defaults to `guard:agent`).
+`AgentConfig::new(api_key)` fills defaults; `GuardAgent::new` validates and normalizes (endpoint trailing slashes and legacy `/api/v1` suffix are stripped). Important fields: `endpoint`, `project_id`, `buffer_size` (100 per kind), `flush_interval` (30s), `status_interval` (300s, minimum 60), `dynamic_rule_interval` (300s, minimum 60; drives the background rules loop started by `start` only when `project_id` is set), `high_watermark_ratio` (0.8), `buffer_overflow_policy` (`drop`/`block`/`raise`), `retry_attempts` (3), `backoff_factor` (1.0), `timeout` (30s), `compression_enabled` + `compression_threshold` (1024 bytes), `payload_signing_secret`, `install_id`, and with feature `persistence` a `redis: Option<RedisConfig>` (URL carries credentials and DB index; `key_prefix` defaults to `guard:agent`).
 
 A custom store works without the feature: implement `RedisHandler` (five async methods: set, get, delete, list, clear, all namespace-scoped) and call `agent.attach_redis_handler(Arc::new(store)).await` before `start()`.
 
@@ -91,8 +91,8 @@ Mirror the Python agent unless a deviation is documented here:
 - Flush triggers: buffer occupancy at or above `buffer_size * high_watermark_ratio`, or `flush_interval` elapsed since the last drain. A semaphore (`max_concurrent_flushes`) serializes flushes.
 - Per-kind failure streaks: after a failed events or metrics flush, that kind is gated for `min(flush_interval * 2^(streak-1), 300)` seconds. Success resets the streak.
 - Degraded state (computed in `get_status`): circuit breaker OPEN, buffer at 90% of capacity, or lifetime failure rate above 10%. `health_check` adds the 95% buffer and 50% failure-rate thresholds.
-- The HMAC signature covers the uncompressed JSON body. The server verifies the signature after its gzip middleware decompresses the request, so this agent deliberately fixes the Python/TS defect of signing the post-gzip bytes.
-- Success is any 2xx. The real API returns 200 (with a `TelemetryResponse` body), not 202; partial failures also return 200 with `success: false` or a non-empty `errors` list.
+- The HMAC signature covers the uncompressed JSON body, like the Python agent (`_transport_dispatch.py:108-126`). The server verifies the signature after its gzip middleware decompresses the request, so signing the post-gzip bytes would never verify.
+- Success is exactly 200 or 201 (202 and 204 are transient failures, as in the Python agent). The real API returns 200 (with a `TelemetryResponse` body); partial failures also return 200 with `success: false` or a truthy `errors` value.
 
 ## Development Commands
 

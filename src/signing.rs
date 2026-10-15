@@ -6,9 +6,9 @@
 //! (`guard-core-api/guard_core_api/api/routers/telemetry_router.py:113` runs
 //! after `core/gzip_request_middleware.py:46` rewrites the body), so signing
 //! the pre-compression bytes is the only form the server can validate. The
-//! Python and TypeScript agents sign the post-gzip wire bytes instead, which
-//! fails verification whenever compression is active; this crate deliberately
-//! signs the plaintext body and documents the difference.
+//! Python agent does the same (`_build_post_body`,
+//! `guard_agent/_transport_dispatch.py:108-126`): it signs the uncompressed
+//! body, then gzips it.
 
 // `KeyInit` (re-exported by hmac 0.13) is what provides `new_from_slice`;
 // `Mac` provides `update`/`finalize`.

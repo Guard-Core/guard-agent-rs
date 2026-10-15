@@ -313,6 +313,7 @@ async fn rules_loop_polls_on_the_configured_interval() {
         .mount(&server)
         .await;
     let mut config = config_for(&server.uri());
+    config.project_id = Some("proj-rules".to_owned());
     config.dynamic_rule_interval = 60;
     // The paused-time pumps advance the clock by 61 seconds per step; a
     // request still in flight during a pump must not hit its deadline and
@@ -350,6 +351,7 @@ async fn failed_polls_are_counted_as_consecutive_loop_failures() {
         .mount(&server)
         .await;
     let mut config = config_for(&server.uri());
+    config.project_id = Some("proj-rules".to_owned());
     config.dynamic_rule_interval = 60;
     // See the loop test above: pumps advance the paused clock in 61 second
     // steps, so the request deadline must exceed a step.

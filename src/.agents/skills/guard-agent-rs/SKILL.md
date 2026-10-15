@@ -12,7 +12,7 @@ Rust telemetry agent for the Guard ecosystem. Buffers security events, metrics, 
 - Public entry points: `GuardAgent::new(AgentConfig)`, `start()`, `send_event(SecurityEvent)`, `send_metric(SecurityMetric)`, `flush_buffer()`, `get_status()`, `get_stats()`, `health_check()`, `stop()`.
 - Ingest never fails: `send_event`/`send_metric` return `()`; `try_send_event` returns `Err` only under the `raise` overflow policy.
 - Endpoints: `POST /api/v1/events`, `/api/v1/metrics`, `/api/v1/status`; headers `X-API-Key`, `X-Project-Id`, `X-Agent-Install-Id`; optional `Content-Encoding: gzip`; optional `X-Payload-Signature: v1=<hmac-sha256 hex of the uncompressed body>`.
-- Success is any 2xx (the real API returns 200). 200 with `success: false` or non-empty `errors` = partial failure = requeue. 429 = honor `Retry-After`. 400/404/422 = drop forever. 413 = halve and retry, drop singletons. 401/403/5xx/network = retry with backoff.
+- Success is exactly 200 or 201 (the real API returns 200). 200 with `success: false` or a truthy `errors` = partial failure = requeue. Other statuses (202, 204, 3xx, 405) and an unparseable or empty-object 200 = retry at once, no breaker failure. 429 = honor `Retry-After`. 400/404/422 = drop forever. 413 = halve and retry, drop singletons. 401/403/5xx/network = retry with backoff.
 
 ## Installation
 
@@ -50,7 +50,7 @@ Custom store without the `persistence` feature: implement `RedisHandler` and cal
 
 - The `block` overflow policy can stall the caller indefinitely while the endpoint is down; the Python agent has the same behavior. Prefer `drop` unless backpressure is intentional.
 - `try_send_event` returns `Err` only under `raise`; `send_event` swallows that error (logging only), mirroring Python. Do not rely on `send_event` for delivery confirmation; check `get_stats()`.
-- Signature covers the uncompressed body (server-verified). If you "fix" it to sign the wire body you reintroduce the Python/TS defect that fails verification whenever gzip kicks in.
+- Signature covers the uncompressed body (server-verified). If you "fix" it to sign the wire body you break verification whenever gzip kicks in (the Python agent signs the uncompressed body too).
 - `status_interval` must be >= 60s (validated); `flush_interval` only needs > 0.
 - Without `payload_signing_secret`, no signature header is sent; the server may require one (`INGEST_REQUIRE_SIGNED_PAYLOADS`).
 - Real-Redis tests are `#[ignore]`d: run `cargo test --all-features -- --include-ignored` with Redis on 127.0.0.1:6379.

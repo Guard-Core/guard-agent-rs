@@ -5,16 +5,21 @@
 //! The transport mirrors `guard_agent/_transport_send.py` and
 //! `_transport_dispatch.py`:
 //!
-//! - success is any 2xx; a 200 body with `success == false` or a non-empty
-//!   `errors` list is a partial failure and is requeued by the caller
+//! - success is exactly 200 or 201; a 200 body with `success == false` or a
+//!   truthy `errors` value is a partial failure and is requeued by the caller
 //!   (the ingestion API returns 200 even on partial failure,
-//!   `telemetry_service.py:741-750`);
+//!   `telemetry_service.py:741-750`); a 200 with an unparseable body or an
+//!   empty JSON object, and any other status the reference does not list
+//!   (202, 204, 3xx, 405, 408, ...), is a transient "no result": retried at
+//!   once, never opening the breaker, never accepted (`_handle_response`
+//!   returns `False`, `_send_with_retry` loops);
 //! - 429 honors `Retry-After` (seconds, capped, default 60);
 //! - 400, 404, and 422 are permanent rejections: the batch is dropped, never
 //!   retried, and reported as confirmed so the flush layer deletes its
 //!   durable records;
 //! - 413 triggers binary split-or-drop: the batch is halved and each half
-//!   retried recursively; a singleton that still 413s is dropped;
+//!   sent (and, with an encryption key, re-encrypted) recursively, the right
+//!   half even when the left failed; a singleton that still 413s is dropped;
 //! - 401, 403, other 4xx, 5xx, and network errors are retryable with
 //!   exponential backoff under the circuit breaker;
 //! - a failed response-body read is retryable on every platform
@@ -22,8 +27,10 @@
 //!   string, so a send whose response body was lost mid-read (timeout, RST,
 //!   TLS truncation) is retried, never counted as accepted.
 //!
-//! One deliberate difference from the Python and TypeScript agents: the HMAC
-//! signature covers the uncompressed JSON body (see [`crate::signing`]).
+//! Like the Python agent, the HMAC signature covers the uncompressed JSON body
+//! (`_transport_dispatch.py:108-126`; see [`crate::signing`]), and the
+//! transport sanitizes event metadata and metric tags a second time before
+//! serializing (`_redact_sensitive_headers`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,11 +46,11 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::config::AgentConfig;
 use crate::encryption::PayloadEncryptor;
 use crate::error::{ErrorStage, GuardAgentError};
-use crate::models::{AgentStatus, DynamicRules, SecurityEvent, SecurityMetric, TelemetryAck};
+use crate::models::{AgentStatus, DynamicRules, SecurityEvent, SecurityMetric};
 use crate::rate_limiter::RateLimiter;
 use crate::signing::sign_payload;
 use crate::utils::{
-    calculate_backoff_delay, generate_batch_id, gzip_bytes, parse_retry_after_seconds,
+    Redactor, calculate_backoff_delay, generate_batch_id, gzip_bytes, parse_retry_after_seconds,
     summarize_response_body,
 };
 
@@ -108,24 +115,44 @@ impl SendOutcome {
 
 /// Internal classification of a single GET attempt (dynamic rules fetch).
 enum GetAttempt {
-    /// A 2xx response whose body parsed as JSON (any JSON type; the caller
+    /// A 200 response whose body parsed as JSON (any JSON type; the caller
     /// rejects non-object payloads like the Python agent).
     Ok(Value),
+    /// A response the reference maps to `False`: retried at once, no
+    /// backoff and no breaker failure (an unparseable 200, a 201, 202, 3xx
+    /// or any other unlisted status).
+    NoResult { detail: String },
     /// A 429 response with a parsed `Retry-After`.
     RateLimited { retry_after_seconds: f64 },
-    /// Any other failure: network error, unreadable body, unparseable 2xx
-    /// body, or a non-2xx status.
+    /// Any other failure: network error, unreadable body, or a listed error
+    /// status (400, 401, 403, 404, 413, 422, 5xx).
     Retryable { error: GuardAgentError },
 }
 
 /// Internal classification of a single HTTP attempt.
 enum AttemptResult {
     Accepted,
-    PartialFailure { errors: Vec<String> },
-    Permanent { status_code: u16, detail: String },
-    TooLarge { detail: String },
-    RateLimited { retry_after_seconds: f64 },
-    Retryable { error: GuardAgentError },
+    PartialFailure {
+        errors: Vec<String>,
+    },
+    Permanent {
+        status_code: u16,
+        detail: String,
+    },
+    /// A response the reference maps to "no result": retried at once, with
+    /// no backoff and no breaker failure.
+    NoResult {
+        detail: String,
+    },
+    TooLarge {
+        detail: String,
+    },
+    RateLimited {
+        retry_after_seconds: f64,
+    },
+    Retryable {
+        error: GuardAgentError,
+    },
 }
 
 /// Signal raised when the server rejects a batch as too large; the caller
@@ -176,12 +203,20 @@ impl BatchItems {
         }
     }
 
-    /// Serializes only the item list for the batch envelope.
-    fn items_value(&self) -> Result<Value, serde_json::Error> {
-        match self {
-            Self::Events(events) => serde_json::to_value(events),
-            Self::Metrics(metrics) => serde_json::to_value(metrics),
+    /// Serializes only the item list for the batch envelope, sanitizing
+    /// each item's `metadata` (events) or `tags` (metrics) once more, like
+    /// the Python transport's `_redact_sensitive_headers`.
+    fn items_value(&self, redactor: &Redactor) -> Result<Value, serde_json::Error> {
+        let (mut value, field) = match self {
+            Self::Events(events) => (serde_json::to_value(events)?, "metadata"),
+            Self::Metrics(metrics) => (serde_json::to_value(metrics)?, "tags"),
+        };
+        for item in value.as_array_mut().into_iter().flatten() {
+            if let Some(target) = item.get_mut(field).filter(|target| target.is_object()) {
+                redactor.redact_value(target);
+            }
         }
+        Ok(value)
     }
 
     /// Returns the item ids for logging, best effort.
@@ -190,6 +225,18 @@ impl BatchItems {
             Self::Events(events) => format!("{} event(s)", events.len()),
             Self::Metrics(metrics) => format!("{} metric(s)", metrics.len()),
         }
+    }
+}
+
+/// Python truthiness of a JSON value.
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_none_or(|n| n != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
     }
 }
 
@@ -208,6 +255,7 @@ pub(crate) struct HttpTransport {
     bytes_sent: AtomicU64,
     header_signature: HeaderName,
     encryptor: Option<PayloadEncryptor>,
+    redactor: Redactor,
 }
 
 impl std::fmt::Debug for HttpTransport {
@@ -256,6 +304,7 @@ impl HttpTransport {
         // the PR notes on the provably-unreachable sites).
         #[cfg(not(coverage))]
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(config.timeout))
             .default_headers(default_headers)
             .build()
@@ -264,6 +313,7 @@ impl HttpTransport {
             })?;
         #[cfg(coverage)]
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(config.timeout))
             .default_headers(default_headers)
             .build()
@@ -297,6 +347,7 @@ impl HttpTransport {
             }
         };
 
+        let redactor = Redactor::new(&config.sensitive_headers);
         Ok(Self {
             client,
             config,
@@ -310,6 +361,7 @@ impl HttpTransport {
             bytes_sent: AtomicU64::new(0),
             header_signature: header_name(HEADER_X_PAYLOAD_SIGNATURE),
             encryptor,
+            redactor,
         })
     }
 
@@ -350,7 +402,7 @@ impl HttpTransport {
     /// `/api/v1/events/encrypted` in the Python envelope instead.
     pub(crate) async fn send_batch(&self, items: BatchItems) -> SendOutcome {
         if self.encryptor.is_some() {
-            return self.send_batch_encrypted(&items).await;
+            return self.send_batch_encrypted(items).await;
         }
 
         // `BatchItems` carries only String-keyed JSON data, so its
@@ -374,11 +426,20 @@ impl HttpTransport {
             .build_batch_body(&items)
             .expect("typed batch serialization is total");
 
-        match self.send_with_retry(items.label(), &body).await {
+        let label = items.label();
+        self.dispatch(items, label, &body).await
+    }
+
+    /// Sends a built body and classifies the result: a permanent rejection
+    /// drops the batch, a 413 splits it (encrypted batches too: each half is
+    /// re-encrypted by the recursive `send_batch`).
+    async fn dispatch(&self, items: BatchItems, label: &'static str, body: &[u8]) -> SendOutcome {
+        match self.send_with_retry(label, body).await {
             Ok(SendOutcome::PermanentDrop {
                 status_code,
                 detail,
             }) => {
+                self.requests_failed.fetch_add(1, Ordering::Relaxed);
                 log::warn!(
                     "Dropping {} batch of {}; permanently rejected ({}): {detail}",
                     items.label(),
@@ -406,7 +467,7 @@ impl HttpTransport {
     /// clear. Serialization failure fires the `encryption` hook and the
     /// batch is retained.
     #[allow(clippy::too_many_lines)] // the coverage pairs double two arms
-    async fn send_batch_encrypted(&self, items: &BatchItems) -> SendOutcome {
+    async fn send_batch_encrypted(&self, items: BatchItems) -> SendOutcome {
         let encryptor = self
             .encryptor
             .as_ref()
@@ -416,11 +477,11 @@ impl HttpTransport {
         // defensive arm is compiled out of the coverage build (see PR notes).
         #[cfg(not(coverage))]
         let payload = match (
-            items.items_value(),
+            items.items_value(&self.redactor),
             serde_json::to_value(Value::Array(Vec::new())),
         ) {
             (Ok(items_value), Ok(empty)) => {
-                let (events, metrics) = match items {
+                let (events, metrics) = match &items {
                     BatchItems::Events(_) => (items_value, empty),
                     BatchItems::Metrics(_) => (empty, items_value),
                 };
@@ -438,9 +499,9 @@ impl HttpTransport {
         #[cfg(coverage)]
         let payload = {
             let items_value = items
-                .items_value()
+                .items_value(&self.redactor)
                 .expect("typed batch serialization is total");
-            let (events, metrics) = match items {
+            let (events, metrics) = match &items {
                 BatchItems::Events(_) => (items_value, Value::Array(Vec::new())),
                 BatchItems::Metrics(_) => (Value::Array(Vec::new()), items_value),
             };
@@ -487,49 +548,7 @@ impl HttpTransport {
         #[cfg(coverage)]
         let body = serde_json::to_vec(&envelope).expect("envelope serialization is total");
 
-        match self.send_with_retry("events/encrypted", &body).await {
-            Ok(SendOutcome::PermanentDrop {
-                status_code,
-                detail,
-            }) => {
-                log::warn!(
-                    "Dropping {} batch of {}; permanently rejected ({}): {detail}",
-                    items.label(),
-                    items.summary(),
-                    status_code
-                );
-                let error = GuardAgentError::Permanent {
-                    status_code,
-                    detail: detail.clone(),
-                };
-                self.fire_hook(ErrorStage::TransportSend, &error);
-                SendOutcome::PermanentDrop {
-                    status_code,
-                    detail,
-                }
-            }
-            Ok(outcome) => outcome,
-            Err(too_large) => {
-                // The encrypted endpoint does not split; an oversize
-                // encrypted batch is dropped with the same confirmation
-                // semantics as an unencodable singleton.
-                log::warn!(
-                    "Dropping encrypted {} batch of {}; payload exceeds size cap even as a single item: {}",
-                    items.label(),
-                    items.len(),
-                    too_large.detail
-                );
-                let detail = too_large.detail;
-                let error = GuardAgentError::PayloadTooLarge {
-                    detail: detail.clone(),
-                };
-                self.fire_hook(ErrorStage::TransportSend, &error);
-                SendOutcome::PermanentDrop {
-                    status_code: 413,
-                    detail,
-                }
-            }
-        }
+        self.dispatch(items, "events/encrypted", &body).await
     }
 
     /// Sends the status payload to `/api/v1/status`. Too-large statuses are
@@ -553,6 +572,19 @@ impl HttpTransport {
         let body = serde_json::to_vec(status).expect("status serialization is total");
 
         match self.send_with_retry("status", &body).await {
+            // Python's blanket `except` turns the `PermanentClientError` into
+            // a False return: a rejected status push is a failed push.
+            Ok(SendOutcome::PermanentDrop {
+                status_code,
+                detail,
+            }) => {
+                let error = GuardAgentError::Permanent {
+                    status_code,
+                    detail,
+                };
+                log::error!("Failed to send status: {error}");
+                SendOutcome::Failed { error }
+            }
             Ok(outcome) => outcome,
             Err(too_large) => {
                 let error = GuardAgentError::PayloadTooLarge {
@@ -633,6 +665,11 @@ impl HttpTransport {
                     // else counts the request as failed and retries.
                     self.requests_failed.fetch_add(1, Ordering::Relaxed);
                     log::warn!("GET {url} returned a non-object JSON payload; retrying");
+                }
+                GetAttempt::NoResult { detail } => {
+                    self.breaker.record_success();
+                    self.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("GET {url} had no usable result: {detail}");
                 }
                 GetAttempt::RateLimited {
                     retry_after_seconds,
@@ -716,29 +753,31 @@ impl HttpTransport {
             }
         };
 
-        if (200..300).contains(&status) {
-            return serde_json::from_str::<Value>(&body_text).map_or_else(
-                |_| GetAttempt::Retryable {
-                    error: GuardAgentError::Transport(format!(
-                        "GET {url} returned status {status} with unparseable JSON body"
-                    )),
+        match status {
+            200 => serde_json::from_str::<Value>(&body_text).map_or_else(
+                |_| GetAttempt::NoResult {
+                    detail: format!("GET {url} returned 200 with an unparseable JSON body"),
                 },
                 GetAttempt::Ok,
-            );
-        }
-        if status == 429 {
-            return GetAttempt::RateLimited {
+            ),
+            429 => GetAttempt::RateLimited {
                 retry_after_seconds: parse_retry_after_seconds(
                     retry_after.as_deref(),
                     DEFAULT_RETRY_AFTER_SECS,
                 ),
-            };
-        }
-        GetAttempt::Retryable {
-            error: GuardAgentError::Transport(format!(
-                "Client error {status} for GET {url}: {}",
-                summarize_response_body(&body_text)
-            )),
+            },
+            400 | 401 | 403 | 404 | 413 | 422 | 500..=599 => GetAttempt::Retryable {
+                error: GuardAgentError::Transport(format!(
+                    "Error {status} for GET {url}: {}",
+                    summarize_response_body(&body_text)
+                )),
+            },
+            code => GetAttempt::NoResult {
+                detail: format!(
+                    "Client error {code} for GET {url}: {}",
+                    summarize_response_body(&body_text)
+                ),
+            },
         }
     }
 
@@ -751,6 +790,7 @@ impl HttpTransport {
                 "Dropping {} batch of {count} item; payload exceeds size cap even as a single item: {detail}",
                 items.label()
             );
+            self.requests_failed.fetch_add(1, Ordering::Relaxed);
             let error = GuardAgentError::PayloadTooLarge {
                 detail: detail.clone(),
             };
@@ -762,19 +802,24 @@ impl HttpTransport {
         }
         let (left, right) = items.split();
         // Boxed to break the async-fn recursion cycle: each half may 413
-        // again, but real depth is bounded by log2 of the batch size.
+        // again, but real depth is bounded by log2 of the batch size. Both
+        // halves are always sent (`left = await ...; right = await ...`); the
+        // batch is confirmed only when both were.
         let left_outcome = Box::pin(self.send_batch(left)).await;
-        if left_outcome.is_confirmed() {
-            Box::pin(self.send_batch(right)).await
-        } else {
+        let right_outcome = Box::pin(self.send_batch(right)).await;
+        if !left_outcome.is_confirmed() {
             left_outcome
+        } else if !right_outcome.is_confirmed() {
+            right_outcome
+        } else {
+            SendOutcome::Accepted
         }
     }
 
     /// Builds the batch envelope for `/api/v1/events` and `/api/v1/metrics`,
     /// mirroring the Python agent's `EventBatch` dump.
     fn build_batch_body(&self, items: &BatchItems) -> Result<Vec<u8>, serde_json::Error> {
-        let items_value = items.items_value()?;
+        let items_value = items.items_value(&self.redactor)?;
         let (events, metrics) = match items {
             BatchItems::Events(_) => (items_value, Value::Array(Vec::new())),
             BatchItems::Metrics(_) => (Value::Array(Vec::new()), items_value),
@@ -796,6 +841,7 @@ impl HttpTransport {
     /// The retry loop: breaker admission, exponential backoff, and
     /// `Retry-After` handling. 413 escapes as [`TooLargeSignal`] for the
     /// split-or-drop caller.
+    #[allow(clippy::too_many_lines)] // one arm per attempt classification
     async fn send_with_retry(
         &self,
         label: &'static str,
@@ -803,6 +849,7 @@ impl HttpTransport {
     ) -> Result<SendOutcome, TooLargeSignal> {
         let total_attempts = self.config.retry_attempts.saturating_add(1);
         let mut attempt: u32 = 0;
+        let mut last_no_result = String::new();
 
         while attempt < total_attempts {
             // Local rate limiter pre-check (mirrors
@@ -861,6 +908,18 @@ impl HttpTransport {
                 AttemptResult::TooLarge { detail } => {
                     return Err(TooLargeSignal { detail });
                 }
+                AttemptResult::NoResult { detail } => {
+                    // The reference's breaker call succeeded, the attempt
+                    // counts as failed, and the loop retries with no sleep.
+                    self.breaker.record_success();
+                    self.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "Attempt {} for {label} had no usable result: {detail}",
+                        attempt + 1
+                    );
+                    last_no_result = detail;
+                    attempt += 1;
+                }
                 AttemptResult::RateLimited {
                     retry_after_seconds,
                 } => {
@@ -897,9 +956,14 @@ impl HttpTransport {
             }
         }
 
-        // The loop above always returns; this is a defensive fallback.
+        // Reached only when every attempt ended without a result (or the
+        // limiter consumed them); the reference returns False without a hook.
         Ok(SendOutcome::Failed {
-            error: GuardAgentError::Transport("retry loop exited unexpectedly".to_owned()),
+            error: GuardAgentError::Transport(if last_no_result.is_empty() {
+                "no attempt produced a usable response".to_owned()
+            } else {
+                last_no_result
+            }),
         })
     }
 
@@ -997,7 +1061,7 @@ impl HttpTransport {
     ) -> AttemptResult {
         match status {
             200 => Self::parse_ack(body_text),
-            201..=299 => AttemptResult::Accepted,
+            201 => AttemptResult::Accepted,
             429 => AttemptResult::RateLimited {
                 retry_after_seconds: parse_retry_after_seconds(
                     retry_after,
@@ -1022,32 +1086,50 @@ impl HttpTransport {
                     summarize_response_body(body_text)
                 )),
             },
-            code => AttemptResult::Retryable {
-                error: GuardAgentError::Transport(format!(
+            code => AttemptResult::NoResult {
+                detail: format!(
                     "Client error {code} for POST {url}: {}",
                     summarize_response_body(body_text)
-                )),
+                ),
             },
         }
     }
 
-    /// Parses a 200 acknowledgement; `success == false` or a non-empty
-    /// `errors` list means a partial failure that the flush layer requeues.
+    /// Classifies a 200 body like `_handle_200` plus `_evaluate_send_result`:
+    /// an unparseable body or an empty object is "no result", a JSON object
+    /// with `success == false` or a truthy `errors` value is a partial
+    /// failure that the flush layer requeues, and any other body (a
+    /// non-empty object, or non-object JSON) is accepted.
     fn parse_ack(body_text: &str) -> AttemptResult {
-        if let Ok(ack) = serde_json::from_str::<TelemetryAck>(body_text) {
-            let errors = ack.errors.unwrap_or_default();
-            if ack.success == Some(false) || !errors.is_empty() {
-                AttemptResult::PartialFailure { errors }
-            } else {
-                AttemptResult::Accepted
-            }
+        let Ok(parsed) = serde_json::from_str::<Value>(body_text) else {
+            return AttemptResult::NoResult {
+                detail: "200 response with unparseable JSON body".to_owned(),
+            };
+        };
+        let Value::Object(map) = parsed else {
+            return AttemptResult::Accepted;
+        };
+        if map.is_empty() {
+            return AttemptResult::NoResult {
+                detail: "200 response with an empty JSON object".to_owned(),
+            };
+        }
+        let errors = map.get("errors").filter(|errors| is_truthy(errors));
+        if map.get("success") == Some(&Value::Bool(false)) || errors.is_some() {
+            let errors = match errors {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map_or_else(|| item.to_string(), str::to_owned)
+                    })
+                    .collect(),
+                Some(other) => vec![other.to_string()],
+                None => Vec::new(),
+            };
+            AttemptResult::PartialFailure { errors }
         } else {
-            log::warn!("200 response with unparseable JSON body; treating as transient failure");
-            AttemptResult::Retryable {
-                error: GuardAgentError::Transport(
-                    "200 response with unparseable JSON body".to_owned(),
-                ),
-            }
+            AttemptResult::Accepted
         }
     }
 
@@ -1184,6 +1266,36 @@ mod tests {
     }
 
     #[test]
+    fn the_transport_redacts_a_second_time_before_serializing() {
+        // Records that bypassed ingest redaction (for example reloaded from
+        // Redis) are sanitized again at the wire, like the Python agent's
+        // `_redact_sensitive_headers`.
+        let transport = transport_for_test();
+        let event = SecurityEvent::new("x").with_metadata(json!({
+            "Authorization": "Bearer secret",
+            "body": "{\"cookie\": \"c=1\", \"keep\": 1}",
+        }));
+        let metric = SecurityMetric::new(MetricType::RequestCount, 1.0)
+            .with_tag("Cookie", "a=b")
+            .with_tag("meta", "{\"x-api-key\": \"k\"}");
+
+        let body = transport
+            .build_batch_body(&BatchItems::Events(vec![event]))
+            .unwrap();
+        let wire = String::from_utf8(body).unwrap();
+        assert!(!wire.contains("Bearer secret"));
+        assert!(!wire.contains("c=1"));
+        assert!(wire.contains("keep"));
+
+        let body = transport
+            .build_batch_body(&BatchItems::Metrics(vec![metric]))
+            .unwrap();
+        let wire = String::from_utf8(body).unwrap();
+        assert!(!wire.contains("a=b"));
+        assert!(!wire.contains("\\\"k\\\""));
+    }
+
+    #[test]
     fn permanent_status_codes_are_exactly_the_python_set() {
         assert_eq!(NON_RETRYABLE_STATUS_CODES, [400, 404, 422]);
     }
@@ -1300,16 +1412,64 @@ mod tests {
     }
 
     #[test]
-    fn classification_accepts_two_hundreds() {
-        for status in [200, 201, 202, 204] {
-            let body = if status == 200 {
-                r#"{"success": true}"#
-            } else {
-                ""
-            };
+    fn classification_accepts_only_200_and_201() {
+        for (status, body) in [(200, r#"{"success": true}"#), (201, ""), (200, "[]")] {
             let result = HttpTransport::classify_response(status, body, "http://x", None);
             assert!(matches!(result, AttemptResult::Accepted), "status {status}");
         }
+        // The reference treats every other status it does not list as a
+        // transient "no result" (`_handle_response` returns False).
+        for status in [202, 204, 301, 302, 307, 308, 405, 408, 409, 410, 418] {
+            let result = HttpTransport::classify_response(status, "x", "http://x", None);
+            assert!(
+                matches!(result, AttemptResult::NoResult { .. }),
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_of_200_bodies_follows_the_reference() {
+        let classify = |body| HttpTransport::classify_response(200, body, "http://x", None);
+        // An empty object is falsy in Python, so `_evaluate_send_result`
+        // retries it.
+        assert!(matches!(classify("{}"), AttemptResult::NoResult { .. }));
+        assert!(matches!(
+            classify(r#"{"success": null}"#),
+            AttemptResult::Accepted
+        ));
+        for body in [
+            r#"{"errors": "quota"}"#,
+            r#"{"errors": {"a": 1}}"#,
+            r#"{"errors": 3}"#,
+            r#"{"errors": true}"#,
+            r#"{"success": false}"#,
+            r#"{"errors": [1, "x"]}"#,
+        ] {
+            assert!(
+                matches!(classify(body), AttemptResult::PartialFailure { .. }),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{"errors": ""}"#,
+            r#"{"errors": 0}"#,
+            r#"{"errors": false}"#,
+            r#"{"errors": null, "ok": 1}"#,
+            r#"{"errors": [], "ok": 1}"#,
+            r#"{"errors": {}, "ok": 1}"#,
+            r#"{"errors": 0.0, "ok": 1}"#,
+        ] {
+            assert!(matches!(classify(body), AttemptResult::Accepted), "{body}");
+        }
+        assert_eq!(
+            partial_errors(classify(r#"{"errors": [1, "x"]}"#)),
+            Some(vec!["1".to_owned(), "x".to_owned()])
+        );
+        assert_eq!(
+            partial_errors(classify(r#"{"errors": "quota"}"#)),
+            Some(vec!["\"quota\"".to_owned()])
+        );
     }
 
     fn partial_errors(result: AttemptResult) -> Option<Vec<String>> {
@@ -1334,7 +1494,7 @@ mod tests {
         // A 2xx-without-errors acknowledgement is not a partial failure:
         // the helper's fallback arm.
         assert_eq!(
-            partial_errors(HttpTransport::classify_response(204, "", "http://x", None)),
+            partial_errors(HttpTransport::classify_response(201, "", "http://x", None)),
             None
         );
 
@@ -1352,9 +1512,9 @@ mod tests {
     }
 
     #[test]
-    fn classification_retries_unparseable_200() {
+    fn classification_treats_unparseable_200_as_no_result() {
         let result = HttpTransport::classify_response(200, "not json", "http://x", None);
-        assert!(matches!(result, AttemptResult::Retryable { .. }));
+        assert!(matches!(result, AttemptResult::NoResult { .. }));
     }
 
     #[test]
@@ -1439,9 +1599,9 @@ mod tests {
     }
 
     #[test]
-    fn other_client_errors_are_retryable() {
+    fn other_client_errors_are_no_result() {
         let result = HttpTransport::classify_response(409, "conflict", "http://x", None);
-        assert!(matches!(result, AttemptResult::Retryable { .. }));
+        assert!(matches!(result, AttemptResult::NoResult { .. }));
     }
 
     #[test]
@@ -1663,6 +1823,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_statuses_the_reference_does_not_list_are_no_result_not_breaker_failures() {
+        crate::test_support::install_trace_logger();
+        // `_handle_response` returns False for 201, 202, 3xx and unlisted 4xx;
+        // `_get_with_retry` then loops at once: no backoff, breaker closed.
+        for status in [201_u16, 202, 302, 405] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/rules"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    ResponseTemplate::new(status).set_body_string(r#"{"rule_id": "r"}"#)
+                })
+                .mount(&server)
+                .await;
+            let mut config = AgentConfig::new("test-api-key-1234");
+            config.endpoint = server.uri();
+            config.timeout = 2;
+            config.retry_attempts = 6;
+            config.backoff_factor = 100.0;
+            config.compression_enabled = false;
+            let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+            let fetched =
+                tokio::time::timeout(Duration::from_secs(10), transport.get_with_retry("rules"))
+                    .await
+                    .expect("no backoff sleeps");
+            assert!(fetched.is_none(), "status {status}");
+            let (sent, failed, _) = transport.counters();
+            assert_eq!((sent, failed), (0, 7), "status {status}");
+            assert_eq!(
+                transport.breaker_state(),
+                crate::circuit_breaker::CircuitBreakerState::Closed
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn get_retry_retries_a_mid_attempt_429_with_retry_after() {
         crate::test_support::install_trace_logger();
         let mut config = AgentConfig::new("test-api-key-1234");
@@ -1781,21 +1977,19 @@ mod tests {
         let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
 
         // The pair splits into singletons; each still 413s, so each is
-        // permanently dropped, and the left half's confirmation drives the
-        // right half through the same path.
+        // dropped (reference: both halves return True, so the batch does).
         let outcome = transport
             .send_batch(BatchItems::Events(vec![
                 SecurityEvent::new("left"),
                 SecurityEvent::new("right"),
             ]))
             .await;
-        assert!(matches!(
-            outcome,
-            SendOutcome::PermanentDrop {
-                status_code: 413,
-                ..
-            }
-        ));
+        assert!(matches!(outcome, SendOutcome::Accepted));
+        assert_eq!(
+            transport.counters().1,
+            2,
+            "each singleton drop is a failed request"
+        );
     }
 
     #[tokio::test]
@@ -2043,11 +2237,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn four_thirteen_splits_are_abandoned_when_the_left_half_fails() {
+    async fn four_thirteen_splits_still_send_the_right_half_when_the_left_fails() {
         crate::test_support::install_trace_logger();
         // First POST (2 items) answers 413; the left singleton then answers
-        // 500 with retries exhausted. The failed half is not confirmed, so
-        // the right half is never sent.
+        // 500 with retries exhausted. The reference still sends the right
+        // half (`left = await ...; right = await ...`) and returns
+        // `left and right`.
         let server = MockServer::start().await;
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let seen_for_mock = std::sync::Arc::clone(&seen);
@@ -2078,9 +2273,42 @@ mod tests {
         assert!(matches!(outcome, SendOutcome::Failed { .. }));
         assert_eq!(
             seen.load(Ordering::Relaxed),
-            2,
-            "the unconfirmed left half stops the split"
+            3,
+            "the right half is sent although the left failed"
         );
+    }
+
+    #[tokio::test]
+    async fn four_thirteen_splits_fail_the_batch_when_only_the_right_half_fails() {
+        crate::test_support::install_trace_logger();
+        let server = MockServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen_for_mock = std::sync::Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .respond_with(move |_request: &wiremock::Request| {
+                match seen_for_mock.fetch_add(1, Ordering::Relaxed) {
+                    0 => ResponseTemplate::new(413).set_body_string("too large"),
+                    1 => ResponseTemplate::new(200).set_body_string(r#"{"success": true}"#),
+                    _ => ResponseTemplate::new(500).set_body_string("down"),
+                }
+            })
+            .mount(&server)
+            .await;
+        let mut config = AgentConfig::new("test-api-key-1234");
+        config.endpoint = server.uri();
+        config.timeout = 2;
+        config.retry_attempts = 0;
+        config.compression_enabled = false;
+        let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
+
+        let outcome = transport
+            .send_batch(BatchItems::Events(vec![
+                SecurityEvent::new("a"),
+                SecurityEvent::new("b"),
+            ]))
+            .await;
+        assert!(matches!(outcome, SendOutcome::Failed { .. }));
+        assert_eq!(seen.load(Ordering::Relaxed), 3);
     }
 
     /// The (status, detail) of a permanent drop.

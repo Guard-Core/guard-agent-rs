@@ -154,10 +154,10 @@ Released. Version 3.2.4, published to crates.io.
 - **At-least-once flush handshake**: drain, send, confirm (delete persisted records) or requeue in the original order.
 - **Retry with exponential backoff**, honoring `Retry-After` on 429, with a client-side circuit breaker (5 consecutive failures open the circuit for 60 seconds).
 - **413 split-or-drop**: batches rejected as too large are halved recursively; a singleton that still exceeds the cap is dropped.
-- **Permanent rejection** for 400, 404, and 422: the batch is dropped without retrying and counted as confirmed.
+- **Permanent rejection** for 400, 404, and 422: the batch is dropped without retrying and counted as confirmed and as sent.
 - **Per-kind failure streaks**: events and metrics back off independently (up to 300 seconds) after failed flushes, and a computed degraded state is exposed to callers and the status endpoint.
 - **Optional Redis persistence** (feature `persistence`): every accepted record is written with a TTL on enqueue, deleted only on confirmation, and reloaded into the buffer on startup. Alternatively, implement the `RedisHandler` trait and inject your own store.
-- **Payload hygiene**: gzip compression above a threshold, HMAC-SHA256 request signing (`X-Payload-Signature: v1=<hex>`), and redaction of sensitive metadata and tag keys.
+- **Payload hygiene**: gzip compression above a threshold, HMAC-SHA256 request signing (`X-Payload-Signature: v1=<hex>`), and redaction of sensitive metadata and tag keys (nested values to depth 10, JSON-looking string values parsed and sanitized, anything deeper redacted wholesale, applied at ingest and again at the transport, like the Python agent).
 - **Failure isolation**: `send_event` and `send_metric` never fail; telemetry problems are visible through stats, status, logs, and an optional `on_error` hook, never in the caller's request path.
 - **Dynamic rules sync**: `GET /api/v1/rules` fetched through the shared retry machinery (rate limiter, circuit breaker, capped `Retry-After`), cached for the document TTL, refreshed by a background loop on `dynamic_rule_interval`; a failed poll keeps the last good rules.
 
@@ -216,17 +216,18 @@ The ingestion API contract is verified against the Guard backend source (`guard-
 
 | Situation | Behavior |
 | --- | --- |
-| 2xx from `POST /api/v1/events`, `/api/v1/metrics`, `/api/v1/status` | Batch confirmed; persisted records deleted |
-| 200 with `success: false` or non-empty `errors` | Partial failure: batch requeued, no in-loop retry |
+| 200 or 201 from `POST /api/v1/events`, `/api/v1/metrics`, `/api/v1/status` | Batch confirmed; persisted records deleted |
+| 200 with `success: false` or a truthy `errors` | Partial failure: batch requeued, no in-loop retry |
 | 429 | Honors `Retry-After` (seconds; default 60, capped at 300) inside the retry loop |
-| 400, 404, 422 | Permanent rejection: batch dropped, durable records deleted, no retry |
-| 413 | Split the batch in half and retry each half; drop a singleton that still 413s |
-| 401, 403, other 4xx, 5xx, network errors | Retryable with exponential backoff under the circuit breaker |
+| 400, 404, 422 | Permanent rejection: batch dropped, durable records deleted, no retry, counted as sent |
+| 413 | Split the batch in half and send each half (re-encrypted when encryption is on), the right half even if the left failed; drop a singleton that still 413s |
+| 401, 403, 5xx, network errors | Retryable with exponential backoff under the circuit breaker |
+| Any other status (202, 204, 3xx, 405, 408, ...), an unparseable 200, or a 200 with an empty JSON object | Transient failure: retried at once without backoff, the breaker stays closed, never counted as accepted |
 | Buffer overflow | Configurable: evict oldest (default), block the caller, or surface an error |
 | Redis write failure | Fail-open: record stays in memory, failure counted in stats |
 | Process restart with persistence | Records with surviving TTL are reloaded into the buffer |
 
-The HMAC signature covers the uncompressed JSON body, which is what the server verifies after its gzip middleware decompresses the request (this intentionally differs from the Python and TypeScript agents, which sign the post-gzip wire bytes and therefore fail verification when compression is active).
+The HMAC signature covers the uncompressed JSON body, which is what the server verifies after its gzip middleware decompresses the request (the Python agent does the same).
 
 ## Configuration
 

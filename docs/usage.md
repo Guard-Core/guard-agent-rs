@@ -60,9 +60,11 @@ triggers an early flush.
 - A 413 (the ingestion API rejects batches above 262144 bytes decompressed)
   splits the batch in half recursively or drops its oldest item rather than
   retrying a permanently oversized payload
-- 400, 404, and 422 are permanent: the batch is dropped and confirmed, not
-  retried
-- 401, 403, other 4xx, 5xx, and network errors are retryable
+- 400, 404, and 422 are permanent: the batch is dropped and confirmed (and
+  counted as sent), not retried
+- 401, 403, 5xx, and network errors are retryable with backoff; any other
+  status (202, 204, 3xx, 405, 408) is retried at once without opening the
+  circuit breaker
 - A 200 with `success: false` (or a non-empty `errors` list) requeues the
   failed items in the original order
 - The circuit breaker opens after 5 consecutive transport failures and
@@ -110,7 +112,7 @@ the batch-send retry machinery: the local rate limiter pre-check, the circuit
 breaker, capped `Retry-After` handling on 429, and exponential backoff.
 
 `start` also spawns a background rules loop on `dynamic_rule_interval`
-(default 300s, minimum 60s). `get_stats()` reports the rules surface:
+(default 300s, minimum 60s) when a `project_id` is configured. `get_stats()` reports the rules surface:
 `rules_fetched` (lifetime refreshes), `cached_rules` (whether a document is
 cached), `rules_last_update` (Unix seconds of the last refresh), and
 `loop_failures.rules` (consecutive failed polls).

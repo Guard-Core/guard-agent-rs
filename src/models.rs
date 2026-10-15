@@ -370,17 +370,6 @@ pub struct AgentStatus {
     pub errors: Vec<String>,
 }
 
-/// Acknowledgement body returned by the ingestion API for events, metrics,
-/// and status posts (`telemetry_models.py:48-58`, `:107-111`).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct TelemetryAck {
-    /// Whether ingestion succeeded; absent on the status heartbeat response.
-    pub success: Option<bool>,
-    /// Per-item or batch level errors; a non-empty list marks a partial
-    /// failure that must be requeued.
-    pub errors: Option<Vec<String>>,
-}
-
 /// Returns the current UTC time, used as the default rule timestamp.
 fn now_utc() -> DateTime<Utc> {
     Utc::now()
@@ -632,23 +621,6 @@ mod tests {
         assert_eq!(value["buffer_size"], 2);
         assert!(value["last_flush"].is_null());
         assert_eq!(value["errors"][0], "Buffer nearly full");
-    }
-
-    #[test]
-    fn telemetry_ack_parses_partial_failure() {
-        let ack: TelemetryAck =
-            serde_json::from_str(r#"{"success": false, "errors": ["Event quota exceeded."]}"#)
-                .unwrap();
-        assert_eq!(ack.success, Some(false));
-        assert_eq!(
-            ack.errors.as_deref(),
-            Some(&["Event quota exceeded.".to_owned()][..])
-        );
-
-        let status_ack: TelemetryAck =
-            serde_json::from_str(r#"{"success": true, "message": "ok"}"#).unwrap();
-        assert_eq!(status_ack.success, Some(true));
-        assert!(status_ack.errors.is_none());
     }
 
     #[test]
