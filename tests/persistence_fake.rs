@@ -118,6 +118,7 @@ async fn drop_policy_confirms_the_evicted_record() {
         .await;
 
     agent.send_event(event(1)).await;
+    agent.wait_for_persists().await;
     agent.send_event(event(2)).await;
     agent.wait_for_persists().await;
 
@@ -204,10 +205,94 @@ async fn persistence_failures_are_fail_open() {
         .await;
 
     agent.send_event(event(1)).await;
+    agent.wait_for_persists().await;
     agent.flush_buffer().await;
 
     let stats = agent.get_stats().await;
     assert_eq!(stats.events_sent, 1, "ingest path unaffected");
     assert_eq!(stats.redis_persist_failures, 1);
     assert!(stats.durability_degraded);
+}
+
+#[tokio::test]
+async fn persist_backlog_warns_once_per_episode() {
+    use guard_agent_rs::{GuardAgentError, RedisHandler};
+
+    /// Writes block until a permit is added, like a stalled Redis.
+    struct Stalled {
+        inner: InMemoryRedisStore,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl RedisHandler for Stalled {
+        async fn set_key(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: &str,
+            ttl_seconds: u64,
+        ) -> Result<(), GuardAgentError> {
+            self.gate.acquire().await.expect("gate open").forget();
+            self.inner.set_key(namespace, key, value, ttl_seconds).await
+        }
+
+        async fn get_key(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<Option<String>, GuardAgentError> {
+            self.inner.get_key(namespace, key).await
+        }
+
+        async fn delete_keys(
+            &self,
+            namespace: &str,
+            keys: &[String],
+        ) -> Result<(), GuardAgentError> {
+            self.inner.delete_keys(namespace, keys).await
+        }
+
+        async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, GuardAgentError> {
+            self.inner.list_keys(namespace).await
+        }
+
+        async fn clear_namespace(&self, namespace: &str) -> Result<(), GuardAgentError> {
+            self.inner.clear_namespace(namespace).await
+        }
+    }
+
+    helpers::init_log_capture();
+    let backlog_warnings = || {
+        helpers::captured_warnings()
+            .iter()
+            .filter(|line| line.contains("persist backlog at buffer_size=8;"))
+            .count()
+    };
+    let store = Arc::new(Stalled {
+        inner: InMemoryRedisStore::new(),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let mut config = failing_config();
+    config.buffer_size = 8;
+    let agent = GuardAgent::new(config).unwrap();
+    agent
+        .attach_redis_handler(Arc::clone(&store) as Arc<_>)
+        .await;
+
+    for index in 0..12 {
+        agent.send_event(event(index)).await;
+    }
+    assert_eq!(backlog_warnings(), 1, "one warning for the first episode");
+    assert_eq!(agent.get_stats().await.redis_persist_failures, 4);
+
+    store.gate.add_permits(8);
+    agent.wait_for_persists().await;
+    for index in 0..12 {
+        agent.send_event(event(index)).await;
+    }
+    assert_eq!(backlog_warnings(), 2, "the second episode warns again");
+
+    store.gate.add_permits(8);
+    agent.wait_for_persists().await;
 }
