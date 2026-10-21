@@ -220,11 +220,18 @@ async fn rules_polling_runs_with_a_project_id() {
     let server = MockServer::start().await;
     let agent = rules_agent(&server, Some("proj-1")).await;
     agent.start().await;
-    for _ in 0..5 {
+    // The request crosses a real socket, so wait for the server to receive it
+    // (real-time deadline) instead of counting pumps.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while paths(&server, "/api/v1/rules").await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no rules poll reached the server within 30 real seconds"
+        );
         pump_once().await;
+        std::thread::sleep(Duration::from_millis(10));
     }
     agent.stop().await;
-    assert!(paths(&server, "/api/v1/rules").await >= 1);
 }
 
 #[tokio::test]
