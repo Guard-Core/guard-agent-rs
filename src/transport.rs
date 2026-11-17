@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use reqwest::header::{
     CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, USER_AGENT,
 };
@@ -829,7 +829,7 @@ impl HttpTransport {
             "events": events,
             "metrics": metrics,
             "batch_id": generate_batch_id(),
-            "created_at": Utc::now(),
+            "created_at": crate::models::chrono_rfc3339::zulu(&Timestamp::now()),
             "compressed": false,
             "agent_version": crate::AGENT_VERSION,
             "guard_version": self.config.guard_version,
@@ -1298,6 +1298,29 @@ mod tests {
     #[test]
     fn permanent_status_codes_are_exactly_the_python_set() {
         assert_eq!(NON_RETRYABLE_STATUS_CODES, [400, 404, 422]);
+    }
+
+    /// The batch envelope's `created_at` rides the same chrono
+    /// `SecondsFormat::AutoSi` wire shape the `SaaS` parses: a `Z` suffix
+    /// and a fraction of 0, 3, 6 or 9 digits.
+    #[test]
+    fn golden_batch_envelope_created_at_keeps_the_chrono_shape() {
+        let transport = transport_for_test();
+        let body = transport
+            .build_batch_body(&BatchItems::Events(vec![SecurityEvent::new(
+                "rate_limited",
+            )]))
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let created = value["created_at"].as_str().unwrap();
+        assert!(created.ends_with('Z'), "{created}");
+        let fraction = created
+            .split_once('.')
+            .map(|(_, rest)| rest.trim_end_matches('Z').len());
+        assert!(
+            matches!(fraction, None | Some(3 | 6 | 9)),
+            "chrono AutoSi fraction class of {created}"
+        );
     }
 
     fn events_of(items: BatchItems) -> Option<Vec<SecurityEvent>> {
@@ -2370,7 +2393,7 @@ mod tests {
         let transport = HttpTransport::new(Arc::new(config), "install-1").unwrap();
 
         let status = crate::models::AgentStatus {
-            timestamp: chrono::Utc::now(),
+            timestamp: Timestamp::now(),
             status: crate::models::AgentHealth::Healthy,
             uptime: 1.0,
             events_sent: 0,

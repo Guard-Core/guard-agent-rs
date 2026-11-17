@@ -59,10 +59,10 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use guard_core_rs::composite::{TelemetryError, TelemetryHandler};
 use guard_core_rs::events::SecurityEvent as FacadeSecurityEvent;
 use guard_core_rs::metrics::SecurityMetric as FacadeSecurityMetric;
+use jiff::Timestamp;
 use tokio::runtime::Handle;
 
 use crate::agent::GuardAgent;
@@ -84,6 +84,12 @@ impl core::fmt::Debug for GuardAgentTelemetry {
     }
 }
 
+/// A facade `SystemTime` as a wire timestamp; a time outside jiff's range
+/// (not reachable from a real clock) reads as now instead of failing.
+fn timestamp_of(time: std::time::SystemTime) -> Timestamp {
+    Timestamp::try_from(time).unwrap_or_else(|_| Timestamp::now())
+}
+
 impl GuardAgentTelemetry {
     /// A bridge over the agent and the runtime that drives it.
     #[must_use]
@@ -96,7 +102,7 @@ impl GuardAgentTelemetry {
     #[must_use]
     pub fn to_agent_event(event: &FacadeSecurityEvent) -> SecurityEvent {
         SecurityEvent {
-            timestamp: DateTime::<Utc>::from(event.timestamp),
+            timestamp: timestamp_of(event.timestamp),
             event_type: event.event_type.clone(),
             ip_address: event.ip_address.clone(),
             country: event.country.clone(),
@@ -139,7 +145,7 @@ impl GuardAgentTelemetry {
             ))
         })?;
         Ok(SecurityMetric {
-            timestamp: DateTime::<Utc>::from(metric.timestamp),
+            timestamp: timestamp_of(metric.timestamp),
             metric_type,
             value: metric.value,
             endpoint: metric.endpoint.clone(),

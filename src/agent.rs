@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -92,7 +92,7 @@ struct CoreState {
     events_retry_after: Option<Instant>,
     metrics_retry_after: Option<Instant>,
     last_flush_instant: Option<Instant>,
-    last_flush: Option<DateTime<Utc>>,
+    last_flush: Option<Timestamp>,
     loop_failures: LoopFailures,
     status_consecutive_failures: u32,
     last_status_push_ok: Option<bool>,
@@ -178,7 +178,7 @@ pub struct AgentStats {
     /// failed.
     pub durability_degraded: bool,
     /// Last drain time, when any flush ran.
-    pub last_flush: Option<DateTime<Utc>>,
+    pub last_flush: Option<Timestamp>,
     /// Consecutive failed status pushes.
     pub status_consecutive_failures: u32,
     /// Outcome of the most recent status push.
@@ -865,7 +865,7 @@ fn compute_status(shared: &Shared, core: &CoreState) -> AgentStatus {
     }
 
     AgentStatus {
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         status,
         uptime: shared.started_at.elapsed().as_secs_f64(),
         events_sent: core.events_sent,
@@ -1318,7 +1318,7 @@ async fn retention_description(shared: &Shared, kind: &str) -> String {
 async fn core_set_last_flush(shared: &Shared) {
     let mut core = shared.core.lock().await;
     core.last_flush_instant = Some(Instant::now());
-    core.last_flush = Some(Utc::now());
+    core.last_flush = Some(Timestamp::now());
     core.space_freed.notify_waiters();
 }
 

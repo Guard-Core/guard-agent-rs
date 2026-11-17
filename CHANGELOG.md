@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Unreleased
+----------
+
+### Breaking
+
+- chrono is replaced by jiff 1.0 (RUSTSEC-2026-0543). `SecurityEvent::timestamp`, `SecurityMetric::timestamp`, `AgentStatus::timestamp` and `last_flush`, `DynamicRules::timestamp` and `expires_at`, `AgentStats::last_flush` and the `with_timestamp` builders use `jiff::Timestamp` instead of `chrono::DateTime<Utc>`. The wire format is byte-identical: no fraction when the sub-second part is zero, otherwise 3, 6 or 9 digits, always a `Z` suffix, and inbound offsets are folded into UTC. Golden tests pin the bytes.
+
 v3.2.4 (2026-10-15)
 -------------------
 
