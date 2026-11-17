@@ -1323,6 +1323,25 @@ mod tests {
         );
     }
 
+    /// The envelope's `created_at` bytes for one fixed second at each
+    /// fraction class (0, 3, 6 and 9 digits), pinned literally.
+    #[test]
+    fn golden_batch_envelope_created_at_pins_exact_bytes() {
+        for (nanos, expected) in [
+            (0, "2026-01-15T12:00:00Z"),
+            (123_000_000, "2026-01-15T12:00:00.123Z"),
+            (123_456_000, "2026-01-15T12:00:00.123456Z"),
+            (123_456_789, "2026-01-15T12:00:00.123456789Z"),
+        ] {
+            let stamp = Timestamp::new(1_768_478_400, nanos).unwrap();
+            assert_eq!(
+                crate::models::chrono_rfc3339::zulu(&stamp),
+                expected,
+                "created_at bytes at {nanos} ns"
+            );
+        }
+    }
+
     fn events_of(items: BatchItems) -> Option<Vec<SecurityEvent>> {
         match items {
             BatchItems::Events(events) => Some(events),
