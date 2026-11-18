@@ -10,7 +10,6 @@ categories    = ["web-programming"]
 description   = "Containerized guard-agent-rs demo: a small HTTP service streaming security telemetry to a Guard Core ingestion endpoint."
 documentation = "https://docs.rs/guard-agent-rs"
 edition       = "2024"
-homepage      = "https://github.com/Guard-Core/guard-agent-rs"
 keywords      = ["security", "telemetry", "monitoring", "api", "waf"]
 license       = "MIT OR Apache-2.0"
 repository    = "https://github.com/Guard-Core/guard-agent-rs"
