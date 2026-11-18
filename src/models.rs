@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub(crate) mod chrono_rfc3339 {
     use core::str::FromStr;
     use jiff::Timestamp;
+    use jiff::fmt::temporal::Pieces;
     use serde::{Deserialize, Deserializer, Serializer};
 
     /// chrono's `SecondsFormat::AutoSi` digit class of `nanos`.
@@ -31,6 +32,27 @@ pub(crate) mod chrono_rfc3339 {
             6
         } else {
             9
+        }
+    }
+
+    /// chrono read any four digit year, and jiff's range ends a day short
+    /// of `9999-12-31T23:59:59Z`, the usual "never expires" stamp: a
+    /// well-formed RFC 3339 text outside the range saturates to the
+    /// nearest bound instead of failing the whole payload.
+    fn parse_saturating(text: &str) -> Result<Timestamp, jiff::Error> {
+        let error = match Timestamp::from_str(text) {
+            Ok(timestamp) => return Ok(timestamp),
+            Err(error) => error,
+        };
+        match Pieces::parse(text) {
+            Ok(pieces) if pieces.time().is_some() && pieces.offset().is_some() => {
+                Ok(if pieces.date().year() > 0 {
+                    Timestamp::MAX
+                } else {
+                    Timestamp::MIN
+                })
+            }
+            _ => Err(error),
         }
     }
 
@@ -64,7 +86,7 @@ pub(crate) mod chrono_rfc3339 {
         deserializer: D,
     ) -> Result<Option<Timestamp>, D::Error> {
         let text = Option::<String>::deserialize(deserializer)?;
-        text.map(|text| Timestamp::from_str(&text).map_err(serde::de::Error::custom))
+        text.map(|text| parse_saturating(&text).map_err(serde::de::Error::custom))
             .transpose()
     }
 
@@ -72,7 +94,7 @@ pub(crate) mod chrono_rfc3339 {
     /// folded into UTC.
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
         let text = String::deserialize(deserializer)?;
-        Timestamp::from_str(&text).map_err(serde::de::Error::custom)
+        parse_saturating(&text).map_err(serde::de::Error::custom)
     }
 }
 
@@ -900,6 +922,48 @@ mod tests {
         let wire = serde_json::to_value(&rules).unwrap();
         assert_eq!(wire["timestamp"], "2026-01-15T06:30:00Z");
         assert_eq!(wire["expires_at"], "2026-01-15T20:00:00.123456789Z");
+    }
+
+    /// A "never expires" `9999-12-31T23:59:59Z` is above jiff's maximum
+    /// but chrono read it, so both deserializer shapes saturate.
+    #[test]
+    fn a_far_future_expiry_saturates_instead_of_dropping_the_payload() {
+        let rules: DynamicRules = serde_json::from_value(json!({
+            "timestamp": "2026-01-15T12:00:00Z",
+            "expires_at": "9999-12-31T23:59:59Z",
+        }))
+        .unwrap();
+        assert_eq!(rules.expires_at, Some(Timestamp::MAX));
+        let required: DynamicRules =
+            serde_json::from_value(json!({"timestamp": "9999-12-31T23:59:59-05:00"})).unwrap();
+        assert_eq!(required.timestamp, Timestamp::MAX);
+        let below: DynamicRules = serde_json::from_value(
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "-009999-01-01T00:00:00Z"}),
+        )
+        .unwrap();
+        assert_eq!(below.expires_at, Some(Timestamp::MIN));
+        for malformed in [
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "not a time"}),
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "9999-12-31"}),
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "9999-12-31T23:59:59"}),
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "9999-13-31T23:59:59Z"}),
+        ] {
+            assert!(
+                serde_json::from_value::<DynamicRules>(malformed.clone()).is_err(),
+                "{malformed} stays rejected"
+            );
+        }
+    }
+
+    /// chrono kept a `:60` leap second; the codec folds it into `:59`.
+    #[test]
+    fn a_leap_second_folds_into_the_last_second_of_the_minute() {
+        let rules: DynamicRules = serde_json::from_value(
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "2016-12-31T23:59:60Z"}),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&rules).unwrap();
+        assert_eq!(wire["expires_at"], "2016-12-31T23:59:59Z");
     }
 
     #[test]

@@ -11,6 +11,10 @@ Unreleased
 
 - chrono is replaced by jiff 1.0 (RUSTSEC-2026-0543). `SecurityEvent::timestamp`, `SecurityMetric::timestamp`, `AgentStatus::timestamp` and `last_flush`, `DynamicRules::timestamp` and `expires_at`, `AgentStats::last_flush` and the `with_timestamp` builders use `jiff::Timestamp` instead of `chrono::DateTime<Utc>`. The wire format is byte-identical: no fraction when the sub-second part is zero, otherwise 3, 6 or 9 digits, always a `Z` suffix, and inbound offsets are folded into UTC. Golden tests pin the bytes.
 
+### Changed
+
+- A `DynamicRules` timestamp above jiff's range, such as the `9999-12-31T23:59:59Z` "never expires" stamp the SaaS accepts, saturates to `Timestamp::MAX` (below the range to `Timestamp::MIN`) instead of failing the payload, and a leap second `23:59:60Z` folds into `23:59:59Z` where chrono kept `:60`.
+
 v3.2.4 (2026-10-15)
 -------------------
 
