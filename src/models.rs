@@ -5,11 +5,98 @@
 //! Timestamps render as RFC 3339 (ISO 8601) strings, which the Pydantic-backed
 //! server parses natively.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
+
+/// The chrono `DateTime<Utc>` RFC 3339 wire shape the telemetry carries,
+/// reproduced byte for byte on `jiff::Timestamp`: no fraction when the
+/// sub-second part is zero, otherwise chrono's 3, 6 or 9 digit classes,
+/// offsets folded into UTC, the suffix always `Z`. The `SaaS` parses these
+/// fields, so the bytes must not change.
+pub(crate) mod chrono_rfc3339 {
+    use core::str::FromStr;
+    use jiff::Timestamp;
+    use jiff::fmt::temporal::Pieces;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// chrono's `SecondsFormat::AutoSi` digit class of `nanos`.
+    const fn precision_of(nanos: i32) -> usize {
+        if nanos == 0 {
+            0
+        } else if nanos % 1_000_000 == 0 {
+            3
+        } else if nanos % 1_000 == 0 {
+            6
+        } else {
+            9
+        }
+    }
+
+    /// chrono read any four digit year, and jiff's range ends a day short
+    /// of `9999-12-31T23:59:59Z`, the usual "never expires" stamp: a
+    /// well-formed RFC 3339 text outside the range saturates to the
+    /// nearest bound instead of failing the whole payload.
+    fn parse_saturating(text: &str) -> Result<Timestamp, jiff::Error> {
+        let error = match Timestamp::from_str(text) {
+            Ok(timestamp) => return Ok(timestamp),
+            Err(error) => error,
+        };
+        match Pieces::parse(text) {
+            Ok(pieces) if pieces.time().is_some() && pieces.offset().is_some() => {
+                Ok(if pieces.date().year() > 0 {
+                    Timestamp::MAX
+                } else {
+                    Timestamp::MIN
+                })
+            }
+            _ => Err(error),
+        }
+    }
+
+    /// The `Z`-suffixed RFC 3339 text exactly as chrono wrote it.
+    pub fn zulu(value: &Timestamp) -> String {
+        let precision = precision_of(value.subsec_nanosecond());
+        if precision == 0 {
+            value.to_string()
+        } else {
+            format!("{value:.precision$}")
+        }
+    }
+
+    /// The field arrives as `&Option<Timestamp>` when the model carries
+    /// the optional shape and as `&Timestamp` otherwise; the generic
+    /// covers both field types.
+    pub fn serialize<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Copy + Into<Option<Timestamp>>,
+    {
+        match (*value).into() {
+            Some(timestamp) => serializer.serialize_str(&zulu(&timestamp)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// The optional field shape (`expires_at`, `last_flush`): a `null`
+    /// or an RFC 3339 string, folded into UTC.
+    pub fn deserialize_opt<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Timestamp>, D::Error> {
+        let text = Option::<String>::deserialize(deserializer)?;
+        text.map(|text| parse_saturating(&text).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+
+    /// The required field shape (`timestamp`): an RFC 3339 string,
+    /// folded into UTC.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse_saturating(&text).map_err(serde::de::Error::custom)
+    }
+}
 
 /// The event types the Guard ecosystem emits, mirroring the Python agent's
 /// `KNOWN_EVENT_TYPES` (`guard_agent/models.py:20-55`).
@@ -114,7 +201,8 @@ pub struct SecurityEvent {
     /// Client-generated deduplication key.
     pub idempotency_key: Uuid,
     /// When the event happened.
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "chrono_rfc3339")]
+    pub timestamp: Timestamp,
     /// Event type label, for example `rate_limited`.
     pub event_type: String,
     /// Client IP address when known, empty string otherwise.
@@ -154,7 +242,7 @@ impl SecurityEvent {
     pub fn new(event_type: impl Into<String>) -> Self {
         Self {
             idempotency_key: Uuid::new_v4(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             event_type: event_type.into(),
             ip_address: String::new(),
             country: None,
@@ -280,7 +368,7 @@ impl SecurityEvent {
 
     /// Overrides the timestamp.
     #[must_use]
-    pub const fn with_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
+    pub const fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = timestamp;
         self
     }
@@ -290,7 +378,8 @@ impl SecurityEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecurityMetric {
     /// When the sample was taken.
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "chrono_rfc3339")]
+    pub timestamp: Timestamp,
     /// Metric kind.
     pub metric_type: MetricType,
     /// Sample value.
@@ -306,7 +395,7 @@ impl SecurityMetric {
     #[must_use]
     pub fn new(metric_type: MetricType, value: f64) -> Self {
         Self {
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             metric_type,
             value,
             endpoint: None,
@@ -330,7 +419,7 @@ impl SecurityMetric {
 
     /// Overrides the timestamp.
     #[must_use]
-    pub const fn with_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
+    pub const fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = timestamp;
         self
     }
@@ -353,7 +442,8 @@ pub enum AgentHealth {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentStatus {
     /// When the status was computed.
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "chrono_rfc3339")]
+    pub timestamp: Timestamp,
     /// Computed health.
     pub status: AgentHealth,
     /// Seconds since agent construction.
@@ -365,14 +455,15 @@ pub struct AgentStatus {
     /// Events plus metrics currently buffered.
     pub buffer_size: u64,
     /// Last successful drain time, when any flush ran.
-    pub last_flush: Option<DateTime<Utc>>,
+    #[serde(with = "chrono_rfc3339")]
+    pub last_flush: Option<Timestamp>,
     /// Degradation reasons, empty when healthy.
     pub errors: Vec<String>,
 }
 
 /// Returns the current UTC time, used as the default rule timestamp.
-fn now_utc() -> DateTime<Utc> {
-    Utc::now()
+fn now_utc() -> Timestamp {
+    Timestamp::now()
 }
 
 /// Dynamic rules received from the `SaaS` platform via `GET /api/v1/rules`,
@@ -394,10 +485,14 @@ pub struct DynamicRules {
     /// Rule version number.
     pub version: u64,
     /// Rule creation/update timestamp.
-    #[serde(default = "now_utc")]
-    pub timestamp: DateTime<Utc>,
+    #[serde(default = "now_utc", with = "chrono_rfc3339")]
+    pub timestamp: Timestamp,
     /// Rule expiration time.
-    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(
+        serialize_with = "chrono_rfc3339::serialize",
+        deserialize_with = "chrono_rfc3339::deserialize_opt"
+    )]
+    pub expires_at: Option<Timestamp>,
     /// Cache TTL in seconds (drives the client-side rules cache).
     pub ttl: u64,
     /// IPs to ban.
@@ -508,7 +603,7 @@ mod tests {
 
     #[test]
     fn metric_builders_cover_tags_and_timestamp() {
-        let stamp = chrono::Utc::now();
+        let stamp = Timestamp::now();
         let metric = SecurityMetric::new(MetricType::RequestCount, 1.0)
             .with_tag("route", "/api/users")
             .with_timestamp(stamp);
@@ -605,7 +700,7 @@ mod tests {
     #[test]
     fn status_serializes_snake_case() {
         let status = AgentStatus {
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             status: AgentHealth::Degraded,
             uptime: 12.5,
             events_sent: 3,
@@ -627,11 +722,7 @@ mod tests {
     fn event_round_trips_through_wire_json() {
         let event = SecurityEvent::new("ip_banned")
             .with_ip_address("203.0.113.7")
-            .with_timestamp(
-                DateTime::parse_from_rfc3339("2026-09-20T10:00:00Z")
-                    .unwrap()
-                    .into(),
-            );
+            .with_timestamp("2026-09-20T10:00:00Z".parse().unwrap());
         let json = serde_json::to_string(&event).unwrap();
         let parsed: SecurityEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
@@ -726,15 +817,11 @@ mod tests {
         assert_eq!(rules.message.as_deref(), Some("lockdown"));
         assert_eq!(
             rules.timestamp,
-            DateTime::<Utc>::from(DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z").unwrap())
+            "2026-01-02T03:04:05Z".parse::<Timestamp>().unwrap()
         );
         assert_eq!(
             rules.expires_at,
-            Some(
-                DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
-                    .unwrap()
-                    .into()
-            )
+            Some("2030-01-01T00:00:00Z".parse().unwrap())
         );
         assert_eq!(rules.enable_penetration_detection, None);
     }
@@ -766,6 +853,117 @@ mod tests {
         }
         let parsed: DynamicRules = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, rules);
+    }
+
+    /// The `SaaS` parses every telemetry timestamp, so the wire bytes are
+    /// pinned: chrono's `SecondsFormat::AutoSi` classes (no fraction when
+    /// zero, otherwise 3, 6 or 9 digits), the `Z` suffix, offsets folded
+    /// into UTC.
+    #[test]
+    fn golden_wire_timestamps_keep_the_chrono_bytes() {
+        for (input, output) in [
+            ("2026-01-15T12:00:00Z", "2026-01-15T12:00:00Z"),
+            ("2026-01-15T12:00:00.123Z", "2026-01-15T12:00:00.123Z"),
+            ("2026-01-15T12:00:00.123456Z", "2026-01-15T12:00:00.123456Z"),
+            (
+                "2026-01-15T12:00:00.123456789Z",
+                "2026-01-15T12:00:00.123456789Z",
+            ),
+            ("2026-01-15T12:00:00+05:30", "2026-01-15T06:30:00Z"),
+        ] {
+            let stamp: Timestamp = input.parse().unwrap();
+            let event = SecurityEvent::new("rate_limited").with_timestamp(stamp);
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(wire["timestamp"], output, "event wire shape of {input}");
+            let metric = SecurityMetric::new(MetricType::RequestCount, 1.0).with_timestamp(stamp);
+            let wire = serde_json::to_value(&metric).unwrap();
+            assert_eq!(wire["timestamp"], output, "metric wire shape of {input}");
+        }
+    }
+
+    /// The status payload's `timestamp` and `last_flush` keep the same
+    /// chrono byte shape the `SaaS` parses today.
+    #[test]
+    fn golden_status_wire_timestamps_keep_the_chrono_bytes() {
+        for (input, output) in [
+            ("2026-01-15T12:00:00Z", "2026-01-15T12:00:00Z"),
+            ("2026-01-15T12:00:00.123456Z", "2026-01-15T12:00:00.123456Z"),
+        ] {
+            let stamp: Timestamp = input.parse().unwrap();
+            let status = AgentStatus {
+                timestamp: stamp,
+                status: AgentHealth::Healthy,
+                uptime: 1.0,
+                events_sent: 0,
+                events_failed: 0,
+                buffer_size: 0,
+                last_flush: Some(stamp),
+                errors: Vec::new(),
+            };
+            let wire = serde_json::to_value(&status).unwrap();
+            assert_eq!(wire["timestamp"], output, "status wire shape of {input}");
+            assert_eq!(
+                wire["last_flush"], output,
+                "last_flush wire shape of {input}"
+            );
+        }
+    }
+
+    /// The dynamic rules timestamps parse chrono-shaped inputs (any RFC
+    /// 3339 offset, any fraction) and re-serialize into the exact bytes
+    /// the chrono build wrote.
+    #[test]
+    fn golden_dynamic_rules_wire_timestamps_keep_the_chrono_bytes() {
+        let rules: DynamicRules = serde_json::from_value(json!({
+            "timestamp": "2026-01-15T12:00:00+05:30",
+            "expires_at": "2026-01-15T12:00:00.123456789-08:00",
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&rules).unwrap();
+        assert_eq!(wire["timestamp"], "2026-01-15T06:30:00Z");
+        assert_eq!(wire["expires_at"], "2026-01-15T20:00:00.123456789Z");
+    }
+
+    /// A "never expires" `9999-12-31T23:59:59Z` is above jiff's maximum
+    /// but chrono read it, so both deserializer shapes saturate.
+    #[test]
+    fn a_far_future_expiry_saturates_instead_of_dropping_the_payload() {
+        let rules: DynamicRules = serde_json::from_value(json!({
+            "timestamp": "2026-01-15T12:00:00Z",
+            "expires_at": "9999-12-31T23:59:59Z",
+        }))
+        .unwrap();
+        assert_eq!(rules.expires_at, Some(Timestamp::MAX));
+        let required: DynamicRules =
+            serde_json::from_value(json!({"timestamp": "9999-12-31T23:59:59-05:00"})).unwrap();
+        assert_eq!(required.timestamp, Timestamp::MAX);
+        let below: DynamicRules = serde_json::from_value(
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "-009999-01-01T00:00:00Z"}),
+        )
+        .unwrap();
+        assert_eq!(below.expires_at, Some(Timestamp::MIN));
+        for malformed in [
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "not a time"}),
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "9999-12-31"}),
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "9999-12-31T23:59:59"}),
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "9999-13-31T23:59:59Z"}),
+        ] {
+            assert!(
+                serde_json::from_value::<DynamicRules>(malformed.clone()).is_err(),
+                "{malformed} stays rejected"
+            );
+        }
+    }
+
+    /// chrono kept a `:60` leap second; the codec folds it into `:59`.
+    #[test]
+    fn a_leap_second_folds_into_the_last_second_of_the_minute() {
+        let rules: DynamicRules = serde_json::from_value(
+            json!({"timestamp": "2026-01-15T12:00:00Z", "expires_at": "2016-12-31T23:59:60Z"}),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&rules).unwrap();
+        assert_eq!(wire["expires_at"], "2016-12-31T23:59:59Z");
     }
 
     #[test]
