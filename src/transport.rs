@@ -1158,6 +1158,16 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn items_value_leaves_non_object_metadata_unredacted() {
+        let redactor = Redactor::new(&[]);
+        let event = SecurityEvent::new("x").with_metadata(json!("plain"));
+        let value = BatchItems::Events(vec![event])
+            .items_value(&redactor)
+            .expect("serializes");
+        assert_eq!(value[0]["metadata"], json!("plain"));
+    }
+
     /// A response body whose read always fails: the in-process twin of a
     /// connection that dies mid-body (read timeout, RST, TLS truncation).
     /// The wire-level truncation tests cannot force a mid-body read error

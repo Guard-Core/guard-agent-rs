@@ -158,10 +158,10 @@ impl GuardAgentTelemetry {
     ///
     /// # Errors
     ///
-    /// [`TelemetryError`] when the serialization fails (the model is
-    /// JSON-derived, so the arm is the defensive guard).
-    pub fn serialize_rules(
-        rules: crate::models::DynamicRules,
+    /// [`TelemetryError`] when the serialization fails (a map with non-string
+    /// keys, for example; the dynamic rules model itself always serializes).
+    pub fn serialize_rules<T: serde::Serialize>(
+        rules: T,
     ) -> Result<Option<serde_json::Value>, TelemetryError> {
         serde_json::to_value(rules)
             .map(Some)
@@ -416,8 +416,7 @@ mod bridge_tests {
                 endpoint: Some(String::from("/api")),
                 tags: BTreeMap::from([(String::from("method"), String::from("GET"))]),
             };
-            let converted = GuardAgentTelemetry::to_agent_metric(&metric)
-                .unwrap_or_else(|error| panic!("{name} converts: {error}"));
+            let converted = GuardAgentTelemetry::to_agent_metric(&metric).expect(name);
             assert_eq!(converted.metric_type.as_str(), name);
             assert!((converted.value - 1.5).abs() < 1e-12);
             assert_eq!(converted.endpoint.as_deref(), Some("/api"));
@@ -443,6 +442,12 @@ mod bridge_tests {
         let debug = format!("{telemetry:?}");
         assert!(debug.contains("GuardAgentTelemetry"));
         assert!(debug.contains("runtime"));
+    }
+
+    #[test]
+    fn the_rules_carrier_reports_a_serialization_failure() {
+        let rules = BTreeMap::from([((1_u8, 2_u8), 3_u8)]);
+        assert!(GuardAgentTelemetry::serialize_rules(rules).is_err());
     }
 
     #[test]
