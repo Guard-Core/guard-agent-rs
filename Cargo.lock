@@ -752,7 +752,6 @@ dependencies = [
  "html-escape",
  "jiff 1.0.0",
  "lru",
- "percent-encoding",
  "rand",
  "regex",
  "rustix",
